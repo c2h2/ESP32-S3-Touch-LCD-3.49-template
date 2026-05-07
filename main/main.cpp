@@ -128,7 +128,10 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
                 }
             } break;
             case 1: {  /* 90 CW: drow[px] = src[(CH-1-px)*CW + py].
-                          Walk px sequentially over canvas rows. */
+                          Stage each canvas row span into internal RAM via
+                          a single memcpy (sequential PSRAM read), then
+                          scatter transposed into the DMA buffer. */
+                uint16_t span[LVGL_FLUSH_STRIP_ROWS];
                 for (int px = 0; px < PW; px++) {
                     int cy = CH - 1 - px;
                     if ((unsigned)cy >= (unsigned)CH) {
@@ -136,12 +139,14 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
                             lvgl_dma_buf[(size_t)r * PW + px] = 0;
                         continue;
                     }
-                    const uint16_t *crow = src + (size_t)cy * CW;
-                    for (int r = 0; r < rows; r++) {
-                        int cx = y1 + r;
-                        lvgl_dma_buf[(size_t)r * PW + px] =
-                            ((unsigned)cx < (unsigned)CW) ? crow[cx] : 0;
-                    }
+                    const uint16_t *crow = src + (size_t)cy * CW + y1;
+                    int span_n = (y1 + rows <= CW) ? rows : (CW - y1);
+                    if (span_n < 0) span_n = 0;
+                    if (span_n > 0) memcpy(span, crow, (size_t)span_n * 2);
+                    for (int r = 0; r < span_n; r++)
+                        lvgl_dma_buf[(size_t)r * PW + px] = span[r];
+                    for (int r = span_n; r < rows; r++)
+                        lvgl_dma_buf[(size_t)r * PW + px] = 0;
                 }
             } break;
             case 2: {  /* 180: drow[px] = src[(CH-1-py)*CW + (CW-1-px)]. */
@@ -160,7 +165,10 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
                     }
                 }
             } break;
-            default: { /* 270 CW: drow[px] = src[px*CW + (CW-1-py)]. */
+            default: { /* 270 CW: drow[px] = src[px*CW + (CW-1-(y1+r))].
+                          Stage canvas row span into internal RAM, then
+                          scatter transposed in reverse order. */
+                uint16_t span[LVGL_FLUSH_STRIP_ROWS];
                 for (int px = 0; px < PW; px++) {
                     int cy = px;
                     if ((unsigned)cy >= (unsigned)CH) {
@@ -168,12 +176,25 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
                             lvgl_dma_buf[(size_t)r * PW + px] = 0;
                         continue;
                     }
-                    const uint16_t *crow = src + (size_t)cy * CW;
-                    for (int r = 0; r < rows; r++) {
-                        int cx = CW - 1 - (y1 + r);
-                        lvgl_dma_buf[(size_t)r * PW + px] =
-                            ((unsigned)cx < (unsigned)CW) ? crow[cx] : 0;
+                    int cx_end_excl = CW - y1;            /* exclusive */
+                    int cx_start    = cx_end_excl - rows; /* may be < 0 */
+                    int span_n = rows;
+                    int dst_skip = 0;
+                    if (cx_start < 0) {
+                        dst_skip = -cx_start;
+                        span_n -= dst_skip;
+                        cx_start = 0;
                     }
+                    if (span_n > 0) {
+                        const uint16_t *crow = src + (size_t)cy * CW + cx_start;
+                        memcpy(span, crow, (size_t)span_n * 2);
+                    }
+                    /* span[0..span_n) holds canvas pixels in increasing cx;
+                       we need decreasing cx, so write in reverse. */
+                    for (int r = 0; r < dst_skip; r++)
+                        lvgl_dma_buf[(size_t)r * PW + px] = 0;
+                    for (int r = 0; r < span_n; r++)
+                        lvgl_dma_buf[(size_t)(dst_skip + r) * PW + px] = span[span_n - 1 - r];
                 }
             } break;
         }
@@ -189,10 +210,11 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
     t_wait_total += esp_timer_get_time() - t_w1;
     int64_t t_total = esp_timer_get_time() - t_frame_start;
     fps_frame_count++;
-    if ((fps_frame_count % 30) == 1) {
+    static uint32_t flush_log_div = 0;
+    if ((flush_log_div++ % 120) == 0) {  /* ~every 5s at 24 FPS */
         ESP_LOGI(TAG,
-                 "flush #%lu rs=%d C=%dx%d total=%lldus xform=%lldus draw=%lldus wait=%lldus",
-                 (unsigned long)fps_frame_count, rs, CW, CH,
+                 "flush rs=%d C=%dx%d total=%lldus xform=%lldus draw=%lldus wait=%lldus",
+                 rs, CW, CH,
                  (long long)t_total, (long long)t_xform_total,
                  (long long)t_draw_total, (long long)t_wait_total);
     }
@@ -213,6 +235,12 @@ static void fps_timer_cb(lv_timer_t *t)
         lv_label_set_text_fmt(fps_label, "FPS %lu.%lu",
                               (unsigned long)(fps_x10 / 10),
                               (unsigned long)(fps_x10 % 10));
+    }
+    static uint32_t print_div = 0;
+    if ((print_div++ & 3) == 0) {  /* ~every 2s */
+        ESP_LOGI(TAG, "fps=%lu.%lu  (frames=%lu in %lu ms)",
+                 (unsigned long)(fps_x10 / 10), (unsigned long)(fps_x10 % 10),
+                 (unsigned long)frames, (unsigned long)dt);
     }
 }
 
