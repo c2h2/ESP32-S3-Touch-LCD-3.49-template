@@ -552,29 +552,66 @@ static void clock_update_cb(lv_timer_t *t)
     lv_label_set_text(g_clock_time_label, buf);
 }
 
+/* Forward decl: sunmap functions used by clock tile. */
+static void sunmap_redraw(void);
+static void sunmap_update_cb(lv_timer_t *t);
+
 static void build_clock_tile(lv_obj_t *parent)
 {
     lv_obj_set_style_bg_color(parent, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* Daylight map fills the tile as background. Size to 3:1 aspect
+       up to the available canvas. */
+    int W = canvas_w;
+    int H = W / 3;
+    if (H > canvas_h) { H = canvas_h; W = H * 3; }
+    g_sunmap_w = W;
+    g_sunmap_h = H;
+    if (g_sunmap_buf) { lv_mem_free(g_sunmap_buf); g_sunmap_buf = NULL; }
+    g_sunmap_buf = (lv_color_t *)lv_mem_alloc((size_t)W * H * sizeof(lv_color_t));
+    if (g_sunmap_buf) {
+        g_sunmap_canvas = lv_canvas_create(parent);
+        lv_canvas_set_buffer(g_sunmap_canvas, g_sunmap_buf, W, H, LV_IMG_CF_TRUE_COLOR);
+        lv_obj_align(g_sunmap_canvas, LV_ALIGN_CENTER, 0, 0);
+        sunmap_redraw();
+        if (!g_sunmap_timer) {
+            g_sunmap_timer = lv_timer_create(sunmap_update_cb, SUNMAP_RECOMPUTE_MS, NULL);
+        }
+    }
+
+    /* Date line above the time -- unscii at 1x. */
     g_clock_date_label = lv_label_create(parent);
     lv_label_set_text(g_clock_date_label, "----.--.--");
-    lv_obj_set_style_text_color(g_clock_date_label, lv_color_make(0xa0, 0xa0, 0xa0), 0);
-    lv_obj_set_style_text_font(g_clock_date_label, &lv_font_montserrat_16, 0);
-    lv_obj_align(g_clock_date_label, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_set_style_text_color(g_clock_date_label, lv_color_make(0xc0, 0xc0, 0xc0), 0);
+    lv_obj_set_style_text_font(g_clock_date_label, &lv_font_unscii_16, 0);
+    /* Subtle dark backdrop so the date is readable over the map. */
+    lv_obj_set_style_bg_color(g_clock_date_label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_clock_date_label, LV_OPA_60, 0);
+    lv_obj_set_style_pad_hor(g_clock_date_label, 4, 0);
+    lv_obj_align(g_clock_date_label, LV_ALIGN_TOP_MID, 0, 6);
 
+    /* Big monospaced time -- unscii_16 scaled 2x via LVGL transform. */
     g_clock_time_label = lv_label_create(parent);
     lv_label_set_text(g_clock_time_label, "--:--:--");
     lv_obj_set_style_text_color(g_clock_time_label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(g_clock_time_label, &lv_font_montserrat_48, 0);
-    lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER, 0, 16);
+    lv_obj_set_style_text_font(g_clock_time_label, &lv_font_unscii_16, 0);
+    lv_obj_set_style_transform_zoom(g_clock_time_label, 2 * 256, 0);  /* 256 = 1.0x */
+    lv_obj_set_style_bg_color(g_clock_time_label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_clock_time_label, LV_OPA_60, 0);
+    lv_obj_set_style_pad_hor(g_clock_time_label, 6, 0);
+    lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER, 0, 8);
 
+    /* Timezone hint, bottom right. */
     lv_obj_t *tz = lv_label_create(parent);
     lv_label_set_text_fmt(tz, "UTC%+d", TZ_OFFSET_HOURS);
-    lv_obj_set_style_text_color(tz, lv_color_make(0x60, 0x60, 0x60), 0);
-    lv_obj_set_style_text_font(tz, &lv_font_montserrat_12, 0);
-    lv_obj_align(tz, LV_ALIGN_BOTTOM_RIGHT, -8, -4);
+    lv_obj_set_style_text_color(tz, lv_color_make(0xa0, 0xa0, 0xa0), 0);
+    lv_obj_set_style_text_font(tz, &lv_font_unscii_16, 0);
+    lv_obj_set_style_bg_color(tz, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(tz, LV_OPA_60, 0);
+    lv_obj_set_style_pad_hor(tz, 4, 0);
+    lv_obj_align(tz, LV_ALIGN_BOTTOM_RIGHT, -6, -4);
 
     if (!g_clock_timer) {
         g_clock_timer = lv_timer_create(clock_update_cb, 500, NULL);
@@ -593,45 +630,181 @@ typedef struct {
     int             n;
 } sun_poly_t;
 
-/* Hand-tuned coarse landmass outlines. Not cartographically accurate,
-   but distinguishable as continents at low resolution. */
+/* Denser hand-tuned continent outlines. Coordinates are (lon, lat) in
+   degrees. Each polygon is closed (first vertex repeated at end). Not
+   cartographically precise but capture enough features (UK, Iberia,
+   Italy, Scandinavia, Arabia, India, Korea, Indochina, Florida, Gulf
+   of Mexico, Hudson Bay, Greenland, Madagascar, Japan, NZ, Indonesia)
+   to be recognizable at ~580x130 pixels. */
+
+/* Eurasia main mass (without UK, Japan, Indonesia, etc.). */
 static const sun_pt_t k_eurasia[] = {
-    {-10, 36},{ 5, 43},{ 12, 45},{ 25, 41},{ 30, 37},{ 35, 34},
-    { 45, 41},{ 60, 42},{ 75, 40},{ 90, 35},{105, 33},{120, 35},
-    {135, 45},{145, 55},{155, 65},{165, 70},{175, 72},
-    {175, 78},{120, 78},{ 80, 78},{ 40, 75},{ 20, 70},{  5, 60},
-    {-10, 55},{-10, 45}
+    /* Iberia */
+    { -9, 43},{ -9, 38},{ -7, 37},{ -3, 36},{  0, 38},{  3, 42},
+    /* France/Italy */
+    {  4, 43},{  7, 44},{  9, 44},{ 12, 45},{ 14, 41},{ 18, 40},
+    { 17, 38},{ 15, 37},{ 13, 38},{ 12, 44},{ 14, 45},{ 16, 46},
+    /* Balkans/Black Sea */
+    { 19, 42},{ 23, 41},{ 28, 41},{ 30, 41},{ 31, 45},{ 36, 45},
+    { 37, 42},{ 36, 36},{ 35, 35},
+    /* Levant/Arabia (part of Asia) */
+    { 36, 32},{ 35, 31},{ 34, 30},{ 32, 30},{ 33, 28},{ 35, 25},
+    { 38, 23},{ 42, 18},{ 44, 14},{ 49, 12},{ 52, 16},{ 54, 17},
+    { 56, 25},{ 50, 27},{ 48, 30},{ 50, 30},{ 56, 27},{ 60, 25},
+    /* Iran/Pakistan */
+    { 62, 25},{ 67, 25},{ 67, 24},{ 68, 23},
+    /* India */
+    { 72, 23},{ 73, 17},{ 78, 11},{ 78,  8},{ 80,  9},{ 80, 13},
+    { 82, 17},{ 87, 21},{ 89, 22},{ 92, 22},{ 91, 25},
+    /* Indochina (mainland) */
+    { 95, 22},{ 99, 16},{102, 10},{105, 10},{108, 10},{109, 14},
+    {107, 17},{109, 21},
+    /* China east coast */
+    {110, 22},{114, 23},{117, 24},{121, 28},{121, 32},{122, 37},
+    {120, 39},{122, 41},
+    /* Korea */
+    {126, 35},{127, 38},{129, 39},{128, 42},{130, 43},
+    /* NE Asia/Russia far east */
+    {131, 45},{135, 49},{140, 53},{144, 57},{152, 60},{160, 62},
+    {170, 65},{180, 68},{180, 72},
+    /* Russia north coast (Arctic) */
+    {165, 72},{140, 75},{105, 78},{ 80, 78},{ 60, 76},{ 40, 73},
+    {  20, 72},
+    /* Scandinavia */
+    { 18, 70},{ 14, 68},{ 12, 65},{  6, 62},{  5, 58},{ 10, 56},
+    /* Baltic / NW Europe */
+    { 12, 54},{  9, 53},{  6, 53},{  4, 51},{  0, 50},{ -1, 49},
+    { -4, 48},{ -5, 44},{ -9, 43}
 };
+
+/* British Isles, simplified. */
+static const sun_pt_t k_uk[] = {
+    { -5, 58},{ -3, 59},{ -1, 58},{  1, 56},{  1, 53},{  0, 51},
+    { -2, 50},{ -5, 50},{ -5, 53},{ -3, 55},{ -5, 58}
+};
+
+/* Japan, four-island silhouette as a single polygon. */
+static const sun_pt_t k_japan[] = {
+    {130, 31},{132, 33},{134, 34},{137, 35},{139, 35},{141, 39},
+    {142, 42},{145, 44},{144, 41},{141, 38},{138, 36},{135, 34},
+    {133, 32},{131, 31},{130, 31}
+};
+
+/* Indonesia: a simplified blob covering Sumatra+Java+Borneo+Sulawesi. */
+static const sun_pt_t k_indonesia[] = {
+    { 95,  5},{ 99,  3},{105, -2},{110, -7},{114, -8},{120, -8},
+    {125, -8},{130, -5},{132, -2},{128,  0},{124,  3},{118,  5},
+    {115,  4},{112,  2},{108, -3},{104, -1},{100,  3},{ 95,  5}
+};
+
+/* New Guinea + nearby. */
+static const sun_pt_t k_newguinea[] = {
+    {130, -2},{135, -3},{140, -3},{146, -6},{151, -8},{148, -10},
+    {142, -10},{137, -8},{132, -5},{130, -2}
+};
+
+/* Africa main mass. */
 static const sun_pt_t k_africa[] = {
-    {-17, 33},{-10, 22},{ -5, 14},{  0,  5},{  5, -5},{ 12,-15},
-    { 18,-25},{ 22,-30},{ 28,-32},{ 35,-25},{ 40,-15},{ 45, -8},
-    { 51, 12},{ 43, 12},{ 35, 22},{ 25, 30},{ 12, 33},{  0, 36},
-    {-10, 35},{-17, 33}
+    {-17, 33},{-12, 28},{ -8, 22},{ -3, 18},{  0, 14},{  3,  8},
+    {  8,  5},{  9,  4},{  9,  2},{ 10,  0},{ 12, -3},{ 14, -8},
+    { 13,-13},{ 12,-17},{ 16,-23},{ 19,-28},{ 23,-32},{ 25,-34},
+    { 30,-32},{ 32,-29},{ 32,-25},{ 35,-22},{ 39,-15},{ 41,-11},
+    { 41, -2},{ 42,  3},{ 45,  9},{ 48, 11},{ 51, 12},{ 50,  9},
+    { 44,  4},{ 42, -3},{ 36, 13},{ 33, 22},{ 30, 26},{ 34, 31},
+    { 32, 32},{ 25, 32},{ 18, 31},{ 11, 33},{  3, 35},{ -3, 35},
+    {-10, 34},{-17, 33}
 };
+
+/* Madagascar. */
+static const sun_pt_t k_madagascar[] = {
+    { 46, -16},{ 49, -13},{ 50, -16},{ 50, -22},{ 47, -25},
+    { 44, -22},{ 44, -19},{ 46, -16}
+};
+
+/* North America main mass. */
 static const sun_pt_t k_n_america[] = {
-    {-160, 70},{-140, 72},{-120, 70},{-100, 65},{ -80, 62},{ -60, 60},
-    { -55, 50},{ -65, 45},{ -75, 38},{ -82, 28},{ -97, 25},{-105, 30},
-    {-117, 32},{-125, 40},{-135, 55},{-150, 60},{-165, 65},{-160, 70}
+    /* Aleutian/Alaska south */
+    {-170, 53},{-155, 56},{-150, 60},{-141, 60},
+    /* Alaska north */
+    {-141, 70},{-156, 71},{-165, 68},
+    /* Canada arctic */
+    {-160, 72},{-140, 73},{-120, 73},{-100, 75},{ -80, 76},{ -65, 78},
+    /* Hudson Bay / Labrador */
+    { -65, 70},{ -75, 65},{ -85, 60},{ -82, 55},{ -78, 60},{ -76, 58},
+    { -68, 55},{ -55, 53},{ -52, 47},
+    /* East coast / New England */
+    { -60, 47},{ -68, 44},{ -73, 41},{ -75, 38},{ -76, 36},{ -78, 33},
+    /* Florida */
+    { -81, 31},{ -81, 25},{ -83, 27},{ -85, 30},
+    /* Gulf of Mexico */
+    { -90, 29},{ -94, 28},{ -97, 27},{ -97, 26},{ -95, 22},{ -91, 19},
+    /* Mexico east */
+    { -88, 18},{ -88, 16},
+    /* Central America */
+    { -83, 12},{ -82,  8},{ -77,  9},
+    /* Mexico Pacific */
+    { -85, 14},{ -94, 16},{-100, 18},{-105, 22},{-110, 24},{-110, 30},
+    /* US Pacific */
+    {-117, 33},{-122, 38},{-124, 42},{-124, 48},{-127, 50},{-132, 54},
+    {-135, 56},{-145, 60},{-155, 60},{-160, 56},{-170, 53}
 };
+
+/* Greenland. */
+static const sun_pt_t k_greenland[] = {
+    { -55, 60},{ -50, 64},{ -42, 65},{ -34, 67},{ -22, 70},{ -20, 75},
+    { -25, 80},{ -45, 82},{ -55, 80},{ -60, 75},{ -55, 70},{ -55, 60}
+};
+
+/* South America. */
 static const sun_pt_t k_s_america[] = {
-    {-80, 10},{-70,  5},{-60, -2},{-50, -5},{-40,-10},{-38,-22},
-    {-50,-35},{-60,-45},{-72,-52},{-72,-40},{-78,-25},{-82,-10},
-    {-80, 10}
+    /* North coast */
+    { -77,  8},{ -72, 11},{ -68, 11},{ -62, 10},{ -56,  8},{ -52,  4},
+    { -50,  1},{ -48, -1},
+    /* East coast (Brazil) */
+    { -42, -3},{ -35, -8},{ -38,-13},{ -40,-22},{ -47,-25},{ -52,-31},
+    { -58,-37},{ -63,-41},{ -68,-46},{ -71,-50},{ -68,-54},
+    /* Patagonia south tip */
+    { -65,-55},{ -71,-53},
+    /* West coast */
+    { -73,-50},{ -74,-44},{ -73,-38},{ -71,-30},{ -71,-20},{ -77,-12},
+    { -80, -4},{ -80,  0},{ -78,  4},{ -77,  8}
 };
+
+/* Australia main mass. */
 static const sun_pt_t k_australia[] = {
-    {115,-22},{125,-15},{140,-12},{150,-22},{152,-32},{145,-38},
-    {130,-35},{118,-30},{115,-22}
+    {114, -22},{114, -27},{116, -32},{120, -34},{125, -33},{130, -32},
+    {137, -35},{140, -38},{144, -38},{149, -37},{152, -32},{153, -28},
+    {153, -25},{151, -22},{146, -18},{142, -11},{138, -12},{135, -15},
+    {130, -12},{124, -14},{120, -18},{114, -22}
 };
+
+/* New Zealand pair. */
+static const sun_pt_t k_nz[] = {
+    {172, -34},{174, -38},{176, -41},{172, -42},{169, -45},{167, -47},
+    {171, -46},{173, -41},{175, -39},{173, -36},{172, -34}
+};
+
+/* Antarctica (very rough). */
 static const sun_pt_t k_antarctica[] = {
-    {-180,-78},{-90,-72},{ 0,-70},{ 90,-72},{180,-78},{180,-90},{-180,-90},{-180,-78}
+    {-180,-72},{-160,-78},{-130,-74},{-100,-72},{ -75,-72},{ -55,-78},
+    { -30,-72},{   0,-70},{  30,-69},{  60,-66},{  90,-66},{ 120,-65},
+    { 150,-72},{ 170,-72},{ 180,-78},
+    { 180,-90},{-180,-90},{-180,-72}
 };
 
 static const sun_poly_t k_continents[] = {
     { k_eurasia,    sizeof(k_eurasia)   /sizeof(sun_pt_t) },
+    { k_uk,         sizeof(k_uk)        /sizeof(sun_pt_t) },
+    { k_japan,      sizeof(k_japan)     /sizeof(sun_pt_t) },
+    { k_indonesia,  sizeof(k_indonesia) /sizeof(sun_pt_t) },
+    { k_newguinea,  sizeof(k_newguinea) /sizeof(sun_pt_t) },
     { k_africa,     sizeof(k_africa)    /sizeof(sun_pt_t) },
+    { k_madagascar, sizeof(k_madagascar)/sizeof(sun_pt_t) },
     { k_n_america,  sizeof(k_n_america) /sizeof(sun_pt_t) },
+    { k_greenland,  sizeof(k_greenland) /sizeof(sun_pt_t) },
     { k_s_america,  sizeof(k_s_america) /sizeof(sun_pt_t) },
     { k_australia,  sizeof(k_australia) /sizeof(sun_pt_t) },
+    { k_nz,         sizeof(k_nz)        /sizeof(sun_pt_t) },
     { k_antarctica, sizeof(k_antarctica)/sizeof(sun_pt_t) },
 };
 
@@ -643,7 +816,7 @@ static void sunmap_fill_poly(lv_color_t *buf, int W, int H,
     /* Build per-row x-intersection lists. */
     for (int y = 0; y < H; y++) {
         float lat = 90.0f - (y + 0.5f) * (180.0f / H);
-        float xs[16];
+        float xs[64];
         int   nx = 0;
         for (int i = 0; i < n - 1; i++) {
             float la = pts[i].lat,     lo_a = pts[i].lon;
@@ -740,42 +913,6 @@ static void sunmap_update_cb(lv_timer_t *t)
     sunmap_redraw();
 }
 
-static void build_sunmap_tile(lv_obj_t *parent)
-{
-    lv_obj_set_style_bg_color(parent, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* Map size: ~3:1 aspect equirectangular, fit inside canvas with margin. */
-    int margin = 16;
-    int max_w = canvas_w - 2 * margin;
-    int max_h = canvas_h - 2 * margin - 16;
-    int W = max_w;
-    int H = W / 3;
-    if (H > max_h) { H = max_h; W = H * 3; }
-
-    g_sunmap_w = W;
-    g_sunmap_h = H;
-    if (g_sunmap_buf) { lv_mem_free(g_sunmap_buf); g_sunmap_buf = NULL; }
-    g_sunmap_buf = (lv_color_t *)lv_mem_alloc((size_t)W * H * sizeof(lv_color_t));
-    if (!g_sunmap_buf) return;
-
-    g_sunmap_canvas = lv_canvas_create(parent);
-    lv_canvas_set_buffer(g_sunmap_canvas, g_sunmap_buf, W, H, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_align(g_sunmap_canvas, LV_ALIGN_CENTER, 0, -4);
-
-    lv_obj_t *cap = lv_label_create(parent);
-    lv_label_set_text(cap, "World daylight  (UTC)");
-    lv_obj_set_style_text_color(cap, lv_color_make(0x80, 0x80, 0x80), 0);
-    lv_obj_set_style_text_font(cap, &lv_font_montserrat_12, 0);
-    lv_obj_align(cap, LV_ALIGN_BOTTOM_MID, 0, -4);
-
-    sunmap_redraw();
-    if (!g_sunmap_timer) {
-        g_sunmap_timer = lv_timer_create(sunmap_update_cb, SUNMAP_RECOMPUTE_MS, NULL);
-    }
-}
-
 /* ---------------------- Hello tile (legacy demo) ---------------------- */
 
 static void build_hello_tile(lv_obj_t *parent, const char *status_text)
@@ -857,16 +994,16 @@ static void build_main_ui(const char *status_text)
     lv_obj_set_style_bg_opa(g_tileview, LV_OPA_COVER, 0);
     lv_obj_set_scrollbar_mode(g_tileview, LV_SCROLLBAR_MODE_OFF);
 
-    lv_obj_t *t_hello  = lv_tileview_add_tile(g_tileview, 0, 0, LV_DIR_RIGHT);
-    lv_obj_t *t_clock  = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    lv_obj_t *t_sunmap = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT);
+    /* Tile 0: clock with the world daylight map as its background.
+       Tile 1: legacy hello-world demo screen (last). */
+    lv_obj_t *t_clock = lv_tileview_add_tile(g_tileview, 0, 0, LV_DIR_RIGHT);
+    lv_obj_t *t_hello = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT);
 
-    build_hello_tile (t_hello,  status_text);
-    build_clock_tile (t_clock);
-    build_sunmap_tile(t_sunmap);
+    build_clock_tile(t_clock);
+    build_hello_tile(t_hello, status_text);
 
     /* Start on the clock. */
-    lv_obj_set_tile_id(g_tileview, 1, 0, LV_ANIM_OFF);
+    lv_obj_set_tile_id(g_tileview, 0, 0, LV_ANIM_OFF);
 }
 
 static void show_main_ui(const char *status_text)
