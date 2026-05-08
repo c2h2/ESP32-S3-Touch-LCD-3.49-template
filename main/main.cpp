@@ -851,13 +851,15 @@ static void sunmap_redraw(void)
     if (!g_sunmap_buf || !g_sunmap_canvas) return;
     const int W = g_sunmap_w;
     const int H = g_sunmap_h;
-    const lv_color_t c_night     = lv_color_black();
-    const lv_color_t c_land_n    = lv_color_make(0x40, 0x40, 0x40);
-    const lv_color_t c_land_d    = lv_color_make(0x90, 0x90, 0x90);
-    const lv_color_t c_water_d   = lv_color_make(0x20, 0x20, 0x20);
+    /* Night side is the "lit" half visually -- water glows lightly,
+       continents glow brighter. Day side is the muted half. */
+    const lv_color_t c_water_n   = lv_color_make(0x20, 0x20, 0x20);
+    const lv_color_t c_land_n    = lv_color_make(0x90, 0x90, 0x90);
+    const lv_color_t c_land_d    = lv_color_make(0x40, 0x40, 0x40);
+    const lv_color_t c_water_d   = lv_color_black();
 
-    /* 1. Fill night background. */
-    for (int i = 0; i < W * H; i++) g_sunmap_buf[i] = c_night;
+    /* 1. Fill default = night water (lit-up dark grey). */
+    for (int i = 0; i < W * H; i++) g_sunmap_buf[i] = c_water_n;
 
     /* 2. Compute subsolar point in radians. */
     struct timeval tv;
@@ -872,7 +874,7 @@ static void sunmap_redraw(void)
     float sl = sun_lat_deg * (float)M_PI / 180.0f;
     float so = sun_lon_deg * (float)M_PI / 180.0f;
 
-    /* 3. Light water (day side) where sun above horizon. */
+    /* 3. Mute day-side water -- sun above horizon = darker. */
     for (int y = 0; y < H; y++) {
         float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
         float sin_lat_p = sinf(lat);
@@ -884,15 +886,13 @@ static void sunmap_redraw(void)
         }
     }
 
-    /* 4. Draw continents: night = mid-grey, day = lighter. We do it per
-       continent in two passes: first fill polygon over the buffer with a
-       sentinel marker, then re-evaluate the day/night for those pixels. */
-    /* Simpler: fill with mid-grey, then re-light the day pixels above. */
+    /* 4. Draw continents: default to night colour (lighter grey),
+       then re-shade day-side land cells to the day colour (darker). */
     for (size_t i = 0; i < sizeof(k_continents)/sizeof(k_continents[0]); i++) {
         sunmap_fill_poly(g_sunmap_buf, W, H,
                          k_continents[i].pts, k_continents[i].n, c_land_n);
     }
-    /* Re-light day-side land pixels. */
+    /* Mute day-side land pixels. */
     for (int y = 0; y < H; y++) {
         float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
         float sin_lat_p = sinf(lat);
