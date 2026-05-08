@@ -34,6 +34,7 @@
 static const char *TAG = "skeleton";
 
 /* Custom JetBrains Mono Bold fonts, generated via lv_font_conv. */
+extern "C" const lv_font_t font_jbmono_48;
 extern "C" const lv_font_t font_jbmono_64;
 extern "C" const lv_font_t font_jbmono_96;
 
@@ -62,12 +63,14 @@ static char              g_status_text[256];
 /* Tileview-based UI: hello | clock (start) | sunmap. Swipe horizontally. */
 static lv_obj_t  *g_tileview         = NULL;
 static lv_obj_t  *g_clock_time_label = NULL;
+static lv_obj_t  *g_clock_ms_label   = NULL;
 static lv_obj_t  *g_clock_date_label = NULL;
 static lv_obj_t  *g_sunmap_canvas    = NULL;
 static lv_color_t *g_sunmap_buf      = NULL;
 static int        g_sunmap_w         = 0;
 static int        g_sunmap_h         = 0;
 static lv_timer_t *g_clock_timer     = NULL;
+static lv_timer_t *g_clock_ms_timer  = NULL;
 static lv_timer_t *g_sunmap_timer    = NULL;
 
 static void show_main_ui(const char *status_text);
@@ -509,10 +512,12 @@ static void rotate_btn_event_cb(lv_event_t *e)
     play_btn_label = NULL;
     g_tileview = NULL;
     g_clock_time_label = NULL;
+    g_clock_ms_label = NULL;
     g_clock_date_label = NULL;
     g_sunmap_canvas = NULL;
-    if (g_clock_timer)  { lv_timer_del(g_clock_timer);  g_clock_timer  = NULL; }
-    if (g_sunmap_timer) { lv_timer_del(g_sunmap_timer); g_sunmap_timer = NULL; }
+    if (g_clock_timer)    { lv_timer_del(g_clock_timer);    g_clock_timer    = NULL; }
+    if (g_clock_ms_timer) { lv_timer_del(g_clock_ms_timer); g_clock_ms_timer = NULL; }
+    if (g_sunmap_timer)   { lv_timer_del(g_sunmap_timer);   g_sunmap_timer   = NULL; }
     show_main_ui(g_status_text);
     ESP_LOGI(TAG, "rotate -> %d deg  canvas=%dx%d", rot_state * 90, canvas_w, canvas_h);
 }
@@ -525,6 +530,20 @@ static void get_display_time(struct tm *out)
     gettimeofday(&tv, NULL);
     time_t t = tv.tv_sec + (time_t)(TZ_OFFSET_HOURS * 3600);
     gmtime_r(&t, out);
+}
+
+static void clock_ms_update_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!g_clock_ms_label) return;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int ms = (int)(tv.tv_usec / 1000);
+    if (ms < 0) ms = 0;
+    if (ms > 999) ms = 999;
+    char buf[8];
+    snprintf(buf, sizeof(buf), ".%03d", ms);
+    lv_label_set_text(g_clock_ms_label, buf);
 }
 
 static void clock_update_cb(lv_timer_t *t)
@@ -597,14 +616,26 @@ static void build_clock_tile(lv_obj_t *parent)
     lv_obj_set_style_radius(g_clock_date_label, 3, 0);
     lv_obj_align(g_clock_date_label, LV_ALIGN_TOP_MID, 0, 4);
 
-    /* Big time in JetBrains Mono Bold 96, dead center of the screen. */
+    /* Big time in JetBrains Mono Bold 96, dead center of the screen.
+       Shifted slightly left to leave room for the millisecond field. */
     g_clock_time_label = lv_label_create(parent);
     lv_label_set_text(g_clock_time_label, "--:--:--");
     lv_obj_set_style_text_color(g_clock_time_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(g_clock_time_label, &font_jbmono_96, 0);
     lv_obj_set_style_bg_opa(g_clock_time_label, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(g_clock_time_label, 0, 0);
-    lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER, -52, 0);
+
+    /* Milliseconds in JBMono 48 (half size of the time face), aligned to
+       sit on the bottom of the time so the digits share a baseline. */
+    g_clock_ms_label = lv_label_create(parent);
+    lv_label_set_text(g_clock_ms_label, ".000");
+    lv_obj_set_style_text_color(g_clock_ms_label, lv_color_make(0xc0, 0xc0, 0xc0), 0);
+    lv_obj_set_style_text_font(g_clock_ms_label, &font_jbmono_48, 0);
+    lv_obj_set_style_bg_opa(g_clock_ms_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(g_clock_ms_label, 0, 0);
+    lv_obj_align_to(g_clock_ms_label, g_clock_time_label,
+                    LV_ALIGN_OUT_RIGHT_BOTTOM, 0, -8);
 
     /* Timezone hint, bottom right. */
     lv_obj_t *tz = lv_label_create(parent);
@@ -619,7 +650,12 @@ static void build_clock_tile(lv_obj_t *parent)
     if (!g_clock_timer) {
         g_clock_timer = lv_timer_create(clock_update_cb, 500, NULL);
     }
+    if (!g_clock_ms_timer) {
+        /* 33 ms tick = ~30 Hz, drives the visible refresh rate. */
+        g_clock_ms_timer = lv_timer_create(clock_ms_update_cb, 33, NULL);
+    }
     clock_update_cb(NULL);
+    clock_ms_update_cb(NULL);
 }
 
 /* ---------------------- Sunmap tile ---------------------- */
