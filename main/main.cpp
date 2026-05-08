@@ -6,6 +6,7 @@
 
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -77,6 +78,15 @@ typedef struct {
     uint16_t dim_s;         /* idle seconds before dim */
     uint16_t off_s;         /* idle seconds before backlight off */
     char     last_ssid[33]; /* last connected SSID */
+    uint8_t  hour24;        /* 1 = 24-hour, 0 = 12-hour */
+    uint8_t  date_fmt;      /* 0=YYYY.MM.DD, 1=DD.MM.YYYY, 2=MM.DD.YYYY */
+    uint8_t  show_seconds;  /* 1 = show :SS digits */
+    uint8_t  show_ms;       /* 1 = show .mmm digits */
+    uint8_t  audio_enable;  /* 1 = audio playback allowed */
+    uint8_t  audio_volume;  /* 0..100 */
+    uint8_t  theme;         /* 0=dark, 1=light, 2=high-contrast */
+    uint8_t  show_fps;      /* 1 = show FPS pill */
+    uint8_t  wifi_autoconnect; /* 1 = auto-connect on boot */
 } app_cfg_t;
 
 static app_cfg_t g_cfg = {
@@ -84,7 +94,16 @@ static app_cfg_t g_cfg = {
     .brightness = 255,
     .dim_s      = 8 * 3600,    /* 8 hours; 0 = never */
     .off_s      = 8 * 3600,    /* 8 hours; 0 = never */
-    .last_ssid  = {0}
+    .last_ssid  = {0},
+    .hour24     = 1,
+    .date_fmt   = 0,
+    .show_seconds = 1,
+    .show_ms    = 1,
+    .audio_enable = 1,
+    .audio_volume = 70,
+    .theme      = 0,
+    .show_fps   = 1,
+    .wifi_autoconnect = 1,
 };
 
 static void cfg_load(void);
@@ -556,6 +575,10 @@ static void lvgl_init(esp_lcd_panel_handle_t panel)
 static void play_btn_event_cb(lv_event_t *e)
 {
     (void)e;
+    if (!g_cfg.audio_enable) {
+        ESP_LOGI(TAG, "play ignored: audio disabled in settings");
+        return;
+    }
     bool now = !audio_min_is_playing();
     audio_min_play_midi(now);
     if (play_btn_label) {
@@ -616,7 +639,7 @@ static void rotate_btn_event_cb(lv_event_t *e)
 
 /* Bump when defaults change so existing devices pick up the new
    values on the next flash instead of keeping stale NVS data. */
-#define CFG_VERSION  4u
+#define CFG_VERSION  5u
 
 /* Optional compiled-in default Wi-Fi credential. The committed source
    defines empty defaults; if main/wifi_secret.h exists locally
@@ -643,6 +666,15 @@ static void cfg_load(void)
     uint8_t  br  = g_cfg.brightness;
     uint16_t ds  = g_cfg.dim_s;
     uint16_t os  = g_cfg.off_s;
+    uint8_t  h24 = g_cfg.hour24;
+    uint8_t  df  = g_cfg.date_fmt;
+    uint8_t  ss  = g_cfg.show_seconds;
+    uint8_t  sm  = g_cfg.show_ms;
+    uint8_t  ae  = g_cfg.audio_enable;
+    uint8_t  av  = g_cfg.audio_volume;
+    uint8_t  th  = g_cfg.theme;
+    uint8_t  sf  = g_cfg.show_fps;
+    uint8_t  wac = g_cfg.wifi_autoconnect;
     size_t   sl  = sizeof(g_cfg.last_ssid);
     nvs_get_u8 (h, "ver",       &ver);
     if (nvs_get_u16(h, "tz_idx", &tzi) != ESP_OK) {
@@ -651,9 +683,21 @@ static void cfg_load(void)
     nvs_get_u8 (h, "bri",       &br);
     nvs_get_u16(h, "dim_s",     &ds);
     nvs_get_u16(h, "off_s",     &os);
+    nvs_get_u8 (h, "h24",       &h24);
+    nvs_get_u8 (h, "date_fmt",  &df);
+    nvs_get_u8 (h, "show_sec",  &ss);
+    nvs_get_u8 (h, "show_ms",   &sm);
+    nvs_get_u8 (h, "aud_en",    &ae);
+    nvs_get_u8 (h, "aud_vol",   &av);
+    nvs_get_u8 (h, "theme",     &th);
+    nvs_get_u8 (h, "show_fps",  &sf);
+    nvs_get_u8 (h, "wifi_ac",   &wac);
     nvs_get_str(h, "last_ssid", g_cfg.last_ssid, &sl);
     nvs_close(h);
     if (tzi >= TZ_CITY_COUNT) tzi = TZ_DEFAULT_CITY_INDEX;
+    if (df > 2)  df  = 0;
+    if (th > 2)  th  = 0;
+    if (av > 100) av = 100;
     if (ver < CFG_VERSION) {
         ESP_LOGI(TAG, "cfg: migrating from v%u -> v%u",
                  (unsigned)ver, (unsigned)CFG_VERSION);
@@ -675,6 +719,15 @@ static void cfg_load(void)
     g_cfg.brightness = br;
     g_cfg.dim_s      = ds;
     g_cfg.off_s      = os;
+    g_cfg.hour24     = h24 ? 1 : 0;
+    g_cfg.date_fmt   = df;
+    g_cfg.show_seconds = ss ? 1 : 0;
+    g_cfg.show_ms    = sm ? 1 : 0;
+    g_cfg.audio_enable = ae ? 1 : 0;
+    g_cfg.audio_volume = av;
+    g_cfg.theme      = th;
+    g_cfg.show_fps   = sf ? 1 : 0;
+    g_cfg.wifi_autoconnect = wac ? 1 : 0;
 }
 
 static void cfg_save(void)
@@ -684,6 +737,15 @@ static void cfg_save(void)
     nvs_set_u8 (h, "ver",       CFG_VERSION);
     nvs_set_u16(h, "tz_idx",    g_cfg.tz_idx);
     nvs_set_u8 (h, "bri",       g_cfg.brightness);
+    nvs_set_u8 (h, "h24",       g_cfg.hour24);
+    nvs_set_u8 (h, "date_fmt",  g_cfg.date_fmt);
+    nvs_set_u8 (h, "show_sec",  g_cfg.show_seconds);
+    nvs_set_u8 (h, "show_ms",   g_cfg.show_ms);
+    nvs_set_u8 (h, "aud_en",    g_cfg.audio_enable);
+    nvs_set_u8 (h, "aud_vol",   g_cfg.audio_volume);
+    nvs_set_u8 (h, "theme",     g_cfg.theme);
+    nvs_set_u8 (h, "show_fps",  g_cfg.show_fps);
+    nvs_set_u8 (h, "wifi_ac",   g_cfg.wifi_autoconnect);
     nvs_set_u16(h, "dim_s",     g_cfg.dim_s);
     nvs_set_u16(h, "off_s",     g_cfg.off_s);
     nvs_set_str(h, "last_ssid", g_cfg.last_ssid);
@@ -987,6 +1049,61 @@ static void dim_timer_cb(lv_timer_t *t)
     }
 }
 
+/* ---------------------- Theme palette ---------------------- */
+
+typedef struct {
+    lv_color_t bg;          /* tile background */
+    lv_color_t text;        /* primary text */
+    lv_color_t menu_surf;   /* settings menu surface */
+    lv_color_t menu_hdr;    /* settings header strip */
+    lv_color_t menu_btn;    /* back button */
+    lv_color_t sunmap_water_n; /* night water */
+    lv_color_t sunmap_water_d; /* day water */
+    lv_color_t sunmap_land_n;  /* night land */
+    lv_color_t sunmap_land_d;  /* day land */
+} theme_palette_t;
+
+static theme_palette_t theme_get(void)
+{
+    theme_palette_t p;
+    switch (g_cfg.theme) {
+    case 1:  /* light */
+        p.bg             = lv_color_make(0xf0, 0xf0, 0xf4);
+        p.text           = lv_color_make(0x10, 0x10, 0x18);
+        p.menu_surf      = lv_color_make(0xe8, 0xe8, 0xee);
+        p.menu_hdr       = lv_color_make(0xc0, 0xc0, 0xcc);
+        p.menu_btn       = lv_color_make(0x90, 0x90, 0xa0);
+        p.sunmap_water_n = lv_color_make(0xb0, 0xb8, 0xc8);
+        p.sunmap_water_d = lv_color_make(0xe0, 0xe4, 0xf0);
+        p.sunmap_land_n  = lv_color_make(0x60, 0x70, 0x80);
+        p.sunmap_land_d  = lv_color_make(0x20, 0x30, 0x40);
+        break;
+    case 2:  /* high contrast */
+        p.bg             = lv_color_black();
+        p.text           = lv_color_make(0xff, 0xff, 0x00);
+        p.menu_surf      = lv_color_black();
+        p.menu_hdr       = lv_color_make(0xff, 0xff, 0x00);
+        p.menu_btn       = lv_color_white();
+        p.sunmap_water_n = lv_color_black();
+        p.sunmap_water_d = lv_color_make(0x40, 0x40, 0x00);
+        p.sunmap_land_n  = lv_color_make(0x80, 0x80, 0x00);
+        p.sunmap_land_d  = lv_color_make(0xff, 0xff, 0x00);
+        break;
+    default: /* dark */
+        p.bg             = lv_color_black();
+        p.text           = lv_color_white();
+        p.menu_surf      = lv_color_make(0x20, 0x20, 0x28);
+        p.menu_hdr       = lv_color_make(0x30, 0x30, 0x3c);
+        p.menu_btn       = lv_color_make(0x50, 0x50, 0x60);
+        p.sunmap_water_n = lv_color_black();
+        p.sunmap_water_d = lv_color_make(0x20, 0x20, 0x20);
+        p.sunmap_land_n  = lv_color_make(0x40, 0x40, 0x40);
+        p.sunmap_land_d  = lv_color_make(0x90, 0x90, 0x90);
+        break;
+    }
+    return p;
+}
+
 /* ---------------------- Clock tile ---------------------- */
 
 static void tz_apply_current(void)
@@ -1016,6 +1133,13 @@ static void clock_ms_update_cb(lv_timer_t *t)
 {
     (void)t;
     if (!g_clock_ms_label) return;
+    if (!g_cfg.show_ms) {
+        if (!lv_obj_has_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_add_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (lv_obj_has_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_clear_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN);
     struct timeval tv;
     gettimeofday(&tv, NULL);
     int ms = (int)(tv.tv_usec / 1000);
@@ -1042,7 +1166,11 @@ static void clock_update_cb(lv_timer_t *t)
     if (mm > 12) mm = 12;
     if (dd < 1) dd = 1;
     if (dd > 31) dd = 31;
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", yyyy, mm, dd);
+    switch (g_cfg.date_fmt) {
+    case 1:  snprintf(buf, sizeof(buf), "%02d.%02d.%04d", dd, mm, yyyy); break;
+    case 2:  snprintf(buf, sizeof(buf), "%02d.%02d.%04d", mm, dd, yyyy); break;
+    default: snprintf(buf, sizeof(buf), "%04d.%02d.%02d", yyyy, mm, dd); break;
+    }
     lv_label_set_text(g_clock_date_label, buf);
     int hh = tm.tm_hour, mi = tm.tm_min, ss = tm.tm_sec;
     if (hh < 0) hh = 0;
@@ -1051,7 +1179,16 @@ static void clock_update_cb(lv_timer_t *t)
     if (mi > 59) mi = 59;
     if (ss < 0) ss = 0;
     if (ss > 60) ss = 60;
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hh, mi, ss);
+    int disp_h = hh;
+    if (!g_cfg.hour24) {
+        disp_h = hh % 12;
+        if (disp_h == 0) disp_h = 12;
+    }
+    if (g_cfg.show_seconds) {
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", disp_h, mi, ss);
+    } else {
+        snprintf(buf, sizeof(buf), "%02d:%02d",       disp_h, mi);
+    }
     lv_label_set_text(g_clock_time_label, buf);
 }
 
@@ -1172,10 +1309,11 @@ static void sunmap_redraw(void)
     const int H = g_sunmap_h;
     /* Four-tone palette: ocean/land x night/day. The mask is sized for
        the canvas (LANDMASK_W x LANDMASK_H = 640 x 172) and indexed 1:1. */
-    const lv_color_t c_water_n = lv_color_black();
-    const lv_color_t c_water_d = lv_color_make(0x20, 0x20, 0x20);
-    const lv_color_t c_land_n  = lv_color_make(0x40, 0x40, 0x40);
-    const lv_color_t c_land_d  = lv_color_make(0x90, 0x90, 0x90);
+    theme_palette_t pal = theme_get();
+    const lv_color_t c_water_n = pal.sunmap_water_n;
+    const lv_color_t c_water_d = pal.sunmap_water_d;
+    const lv_color_t c_land_n  = pal.sunmap_land_n;
+    const lv_color_t c_land_d  = pal.sunmap_land_d;
 
     /* Subsolar point. */
     struct timeval tv;
@@ -1467,10 +1605,14 @@ static void fmt_duration(char *buf, size_t buflen, uint32_t total_s)
     }
 }
 
+#define IDLE_SLIDER_MAX (8 * 3600)
+
 static void dim_s_cb(lv_event_t *e)
 {
     lv_obj_t *s = lv_event_get_target(e);
     int v = lv_slider_get_value(s);
+    if (v < 0) v = 0;
+    if (v > IDLE_SLIDER_MAX) v = IDLE_SLIDER_MAX;
     g_cfg.dim_s = (uint16_t)v;
     lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
     if (lbl) {
@@ -1482,17 +1624,132 @@ static void dim_s_cb(lv_event_t *e)
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
 }
 
+/* ---------- Display sub-page callbacks (12/24h, date fmt, secs/ms, FPS) ---------- */
+
+static void hour_fmt_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    g_cfg.hour24 = lv_obj_has_state(s, LV_STATE_CHECKED) ? 1 : 0;
+    cfg_save();
+    clock_update_cb(NULL);
+}
+
+static void show_sec_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    g_cfg.show_seconds = lv_obj_has_state(s, LV_STATE_CHECKED) ? 1 : 0;
+    cfg_save();
+    clock_update_cb(NULL);
+}
+
+static void show_ms_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    g_cfg.show_ms = lv_obj_has_state(s, LV_STATE_CHECKED) ? 1 : 0;
+    cfg_save();
+}
+
+static void show_fps_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    g_cfg.show_fps = lv_obj_has_state(s, LV_STATE_CHECKED) ? 1 : 0;
+    cfg_save();
+    if (fps_label) {
+        if (g_cfg.show_fps) lv_obj_clear_flag(fps_label, LV_OBJ_FLAG_HIDDEN);
+        else                lv_obj_add_flag(fps_label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void date_fmt_cb(lv_event_t *e)
+{
+    lv_obj_t *r = lv_event_get_target(e);
+    int sel = lv_dropdown_get_selected(r);
+    if (sel < 0) sel = 0;
+    if (sel > 2) sel = 2;
+    g_cfg.date_fmt = (uint8_t)sel;
+    cfg_save();
+    clock_update_cb(NULL);
+}
+
+/* ---------- Sound sub-page callbacks (enable + volume) ---------- */
+
+static void audio_en_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    g_cfg.audio_enable = lv_obj_has_state(s, LV_STATE_CHECKED) ? 1 : 0;
+    if (!g_cfg.audio_enable && audio_min_is_playing()) audio_min_play_midi(false);
+    cfg_save();
+}
+
+static void audio_vol_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    int v = lv_slider_get_value(s);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    g_cfg.audio_volume = (uint8_t)v;
+    audio_min_set_volume(g_cfg.audio_volume);
+    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
+    if (lbl) lv_label_set_text_fmt(lbl, "Volume %d%%", v);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
+}
+
+/* ---------- Theme + Wi-Fi auto-connect ---------- */
+
+static void theme_cb(lv_event_t *e)
+{
+    lv_obj_t *r = lv_event_get_target(e);
+    int sel = lv_dropdown_get_selected(r);
+    if (sel < 0) sel = 0;
+    if (sel > 2) sel = 2;
+    g_cfg.theme = (uint8_t)sel;
+    cfg_save();
+    /* Sunmap can be re-themed live; menu colors apply on next boot. */
+    sunmap_redraw();
+}
+
+static void wifi_ac_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    g_cfg.wifi_autoconnect = lv_obj_has_state(s, LV_STATE_CHECKED) ? 1 : 0;
+    cfg_save();
+}
+
+/* ---------- Reset to defaults ---------- */
+
+static void reset_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_CFG, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (nvs_open(NVS_NS_WIFI, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "settings reset, rebooting");
+    esp_restart();
+}
+
+/* ---------- Auto-dim sliders ---------- */
+
 static void off_s_cb(lv_event_t *e)
 {
     lv_obj_t *s = lv_event_get_target(e);
     int v = lv_slider_get_value(s);
+    if (v < 0) v = 0;
+    if (v > IDLE_SLIDER_MAX) v = IDLE_SLIDER_MAX;
     g_cfg.off_s = (uint16_t)v;
     lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
     if (lbl) {
         char d[24];
         fmt_duration(d, sizeof(d), g_cfg.off_s);
-        if (g_cfg.off_s == 0) lv_label_set_text(lbl, "Off: Never");
-        else                  lv_label_set_text_fmt(lbl, "Off after %s", d);
+        if (g_cfg.off_s == 0) lv_label_set_text(lbl, "Sleep: Never");
+        else                  lv_label_set_text_fmt(lbl, "Sleep after %s", d);
     }
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
 }
@@ -1598,6 +1855,7 @@ static lv_obj_t *build_subpage_brightness(lv_obj_t *menu)
     lv_slider_set_value(bri_s, g_cfg.brightness, LV_ANIM_OFF);
     lv_obj_add_event_cb(bri_s, bri_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(bri_s, bri_slider_cb, LV_EVENT_RELEASED,      NULL);
+    lv_obj_clear_flag(bri_s, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     return page;
 }
@@ -1621,8 +1879,11 @@ static lv_obj_t *build_subpage_autodim(lv_obj_t *menu)
     lv_obj_set_style_text_font(dim_lbl, &lv_font_montserrat_12, 0);
     lv_obj_t *dim_s = lv_slider_create(cont);
     lv_obj_set_width(dim_s, lv_pct(95));
-    lv_slider_set_range(dim_s, 0, 8 * 3600);   /* 0 = never, max 8 h */
+    lv_slider_set_range(dim_s, 0, IDLE_SLIDER_MAX);
     lv_slider_set_value(dim_s, g_cfg.dim_s, LV_ANIM_OFF);
+    /* Don't let horizontal slider drags bubble up and trigger a tileview
+       page swipe. Same for the gesture flag. */
+    lv_obj_clear_flag(dim_s, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_event_cb(dim_s, dim_s_cb, LV_EVENT_VALUE_CHANGED, dim_lbl);
     lv_obj_add_event_cb(dim_s, dim_s_cb, LV_EVENT_RELEASED,      dim_lbl);
 
@@ -1630,19 +1891,137 @@ static lv_obj_t *build_subpage_autodim(lv_obj_t *menu)
     {
         char d[24];
         fmt_duration(d, sizeof(d), g_cfg.off_s);
-        if (g_cfg.off_s == 0) lv_label_set_text(off_lbl, "Off: Never");
-        else                  lv_label_set_text_fmt(off_lbl, "Off after %s", d);
+        if (g_cfg.off_s == 0) lv_label_set_text(off_lbl, "Sleep: Never");
+        else                  lv_label_set_text_fmt(off_lbl, "Sleep after %s", d);
     }
     lv_obj_set_style_text_color(off_lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(off_lbl, &lv_font_montserrat_12, 0);
     lv_obj_t *off_s = lv_slider_create(cont);
     lv_obj_set_width(off_s, lv_pct(95));
-    lv_slider_set_range(off_s, 0, 8 * 3600);  /* 0 = never, max 8 h */
+    lv_slider_set_range(off_s, 0, IDLE_SLIDER_MAX);
     lv_slider_set_value(off_s, g_cfg.off_s, LV_ANIM_OFF);
+    lv_obj_clear_flag(off_s, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_event_cb(off_s, off_s_cb, LV_EVENT_VALUE_CHANGED, off_lbl);
     lv_obj_add_event_cb(off_s, off_s_cb, LV_EVENT_RELEASED,      off_lbl);
 
     return page;
+}
+
+/* Helper: a labelled toggle row (label on the left, switch on the right). */
+static lv_obj_t *add_toggle_row(lv_obj_t *parent, const char *label,
+                                bool checked, lv_event_cb_t cb)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_layout(row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *l = lv_label_create(row);
+    lv_label_set_text(l, label);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_obj_t *sw = lv_switch_create(row);
+    if (checked) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    return row;
+}
+
+static lv_obj_t *build_subpage_display(lv_obj_t *menu)
+{
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Display");
+    lv_obj_set_scroll_dir(page, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_t *cont = lv_menu_cont_create(page);
+    lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(cont, 6, 0);
+
+    add_toggle_row(cont, "24-hour clock", g_cfg.hour24,      hour_fmt_cb);
+    add_toggle_row(cont, "Show seconds",  g_cfg.show_seconds, show_sec_cb);
+    add_toggle_row(cont, "Show ms",       g_cfg.show_ms,      show_ms_cb);
+    add_toggle_row(cont, "Show FPS",      g_cfg.show_fps,     show_fps_cb);
+
+    lv_obj_t *df_l = lv_label_create(cont);
+    lv_label_set_text(df_l, "Date format");
+    lv_obj_set_style_text_font(df_l, &lv_font_montserrat_12, 0);
+    lv_obj_t *df = lv_dropdown_create(cont);
+    lv_dropdown_set_options_static(df,
+        "YYYY.MM.DD\nDD.MM.YYYY\nMM.DD.YYYY");
+    lv_dropdown_set_selected(df, g_cfg.date_fmt);
+    lv_obj_add_event_cb(df, date_fmt_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *th_l = lv_label_create(cont);
+    lv_label_set_text(th_l, "Theme (menu reloads on next boot)");
+    lv_obj_set_style_text_font(th_l, &lv_font_montserrat_12, 0);
+    lv_obj_t *th = lv_dropdown_create(cont);
+    lv_dropdown_set_options_static(th, "Dark\nLight\nHigh contrast");
+    lv_dropdown_set_selected(th, g_cfg.theme);
+    lv_obj_add_event_cb(th, theme_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    return page;
+}
+
+static lv_obj_t *build_subpage_sound(lv_obj_t *menu)
+{
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Sound");
+    lv_obj_t *cont = lv_menu_cont_create(page);
+    lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(cont, 6, 0);
+
+    add_toggle_row(cont, "Sound enabled", g_cfg.audio_enable, audio_en_cb);
+
+    lv_obj_t *vol_lbl = lv_label_create(cont);
+    lv_label_set_text_fmt(vol_lbl, "Volume %u%%", (unsigned)g_cfg.audio_volume);
+    lv_obj_set_style_text_font(vol_lbl, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *vol_s = lv_slider_create(cont);
+    lv_obj_set_width(vol_s, lv_pct(95));
+    lv_slider_set_range(vol_s, 0, 100);
+    lv_slider_set_value(vol_s, g_cfg.audio_volume, LV_ANIM_OFF);
+    lv_obj_clear_flag(vol_s, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(vol_s, audio_vol_cb, LV_EVENT_VALUE_CHANGED, vol_lbl);
+    lv_obj_add_event_cb(vol_s, audio_vol_cb, LV_EVENT_RELEASED,      vol_lbl);
+
+    return page;
+}
+
+static lv_obj_t *build_subpage_reset(lv_obj_t *menu)
+{
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Reset");
+    lv_obj_t *cont = lv_menu_cont_create(page);
+    lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(cont, 6, 0);
+
+    lv_obj_t *l = lv_label_create(cont);
+    lv_label_set_text(l, "Erase all settings + Wi-Fi creds, then reboot.");
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, lv_pct(95));
+
+    lv_obj_t *btn = lv_btn_create(cont);
+    lv_obj_set_height(btn, 32);
+    lv_obj_set_width(btn, 160);
+    lv_obj_set_style_bg_color(btn, lv_color_make(0xa0, 0x20, 0x20), 0);
+    lv_obj_t *bl = lv_label_create(btn);
+    lv_label_set_text(bl, "Erase + reboot");
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(btn, reset_confirm_cb, LV_EVENT_CLICKED, NULL);
+
+    return page;
+}
+
+/* Wi-Fi sub-page is built earlier; add the auto-connect toggle there. */
+static void wifi_subpage_add_autoconnect(lv_obj_t *page)
+{
+    lv_obj_t *cont = lv_obj_get_child(page, 0);
+    if (!cont) return;
+    add_toggle_row(cont, "Auto-connect on boot", g_cfg.wifi_autoconnect, wifi_ac_cb);
 }
 
 static void build_settings_tile(lv_obj_t *parent)
@@ -1652,20 +2031,20 @@ static void build_settings_tile(lv_obj_t *parent)
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_pad_all(parent, 0, 0);
 
+    theme_palette_t pal = theme_get();
     lv_obj_t *menu = lv_menu_create(parent);
     lv_obj_set_size(menu, lv_pct(100), lv_pct(100));
     /* Show a back button on sub-pages, none on the root list. */
     lv_menu_set_mode_header(menu, LV_MENU_HEADER_TOP_FIXED);
     lv_menu_set_mode_root_back_btn(menu, LV_MENU_ROOT_BACK_BTN_DISABLED);
-    /* Lighter menu surface so items are easier to read. */
-    lv_obj_set_style_bg_color(menu, lv_color_make(0x20, 0x20, 0x28), 0);
-    lv_obj_set_style_text_color(menu, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(menu, pal.menu_surf, 0);
+    lv_obj_set_style_text_color(menu, pal.text, 0);
     lv_obj_set_style_text_font(menu, &lv_font_montserrat_12, 0);
 
     /* Header bar: contrasting strip, back button anchored top-right. */
     lv_obj_t *hdr = lv_menu_get_main_header(menu);
     if (hdr) {
-        lv_obj_set_style_bg_color(hdr, lv_color_make(0x30, 0x30, 0x3c), 0);
+        lv_obj_set_style_bg_color(hdr, pal.menu_hdr, 0);
         lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
         lv_obj_set_style_pad_all(hdr, 4, 0);
         lv_obj_set_style_pad_gap(hdr, 6, 0);
@@ -1676,7 +2055,7 @@ static void build_settings_tile(lv_obj_t *parent)
     lv_obj_t *back = lv_menu_get_main_header_back_btn(menu);
     if (back) {
         lv_obj_set_size(back, 60, 32);
-        lv_obj_set_style_bg_color(back, lv_color_make(0x50, 0x50, 0x60), 0);
+        lv_obj_set_style_bg_color(back, pal.menu_btn, 0);
         lv_obj_set_style_bg_opa(back, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(back, 4, 0);
         /* lv_menu already added an lv_img arrow as the first child; hide it
@@ -1693,42 +2072,34 @@ static void build_settings_tile(lv_obj_t *parent)
 
     /* Build sub-pages first; the main page links them. */
     lv_obj_t *p_wifi = build_subpage_wifi(menu);
-    lv_obj_t *p_tz   = build_subpage_tz(menu);
-    lv_obj_t *p_bri  = build_subpage_brightness(menu);
-    lv_obj_t *p_dim  = build_subpage_autodim(menu);
+    wifi_subpage_add_autoconnect(p_wifi);
+    lv_obj_t *p_tz    = build_subpage_tz(menu);
+    lv_obj_t *p_bri   = build_subpage_brightness(menu);
+    lv_obj_t *p_dim   = build_subpage_autodim(menu);
+    lv_obj_t *p_disp  = build_subpage_display(menu);
+    lv_obj_t *p_snd   = build_subpage_sound(menu);
+    lv_obj_t *p_reset = build_subpage_reset(menu);
 
     /* Main (root) page: list of menu items. Scrolls vertically if
        there are more entries than fit on the 172 px tall canvas. */
     lv_obj_t *main_page = lv_menu_page_create(menu, NULL);
     lv_obj_set_scroll_dir(main_page, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(main_page, LV_SCROLLBAR_MODE_AUTO);
-    {
+    struct { const char *icon_label; lv_obj_t *page; } rows[] = {
+        { LV_SYMBOL_WIFI     "  Wi-Fi",      p_wifi  },
+        { LV_SYMBOL_BELL     "  Time zone",  p_tz    },
+        { LV_SYMBOL_IMAGE    "  Display",    p_disp  },
+        { LV_SYMBOL_AUDIO    "  Sound",      p_snd   },
+        { LV_SYMBOL_EYE_OPEN "  Brightness", p_bri   },
+        { LV_SYMBOL_POWER    "  Auto-dim",   p_dim   },
+        { LV_SYMBOL_TRASH    "  Reset",      p_reset },
+    };
+    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         lv_obj_t *cont = lv_menu_cont_create(main_page);
         lv_obj_t *l    = lv_label_create(cont);
-        lv_label_set_text(l, LV_SYMBOL_WIFI "  Wi-Fi");
+        lv_label_set_text(l, rows[i].icon_label);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
-        lv_menu_set_load_page_event(menu, cont, p_wifi);
-    }
-    {
-        lv_obj_t *cont = lv_menu_cont_create(main_page);
-        lv_obj_t *l    = lv_label_create(cont);
-        lv_label_set_text(l, LV_SYMBOL_BELL "  Time zone");
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
-        lv_menu_set_load_page_event(menu, cont, p_tz);
-    }
-    {
-        lv_obj_t *cont = lv_menu_cont_create(main_page);
-        lv_obj_t *l    = lv_label_create(cont);
-        lv_label_set_text(l, LV_SYMBOL_EYE_OPEN "  Brightness");
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
-        lv_menu_set_load_page_event(menu, cont, p_bri);
-    }
-    {
-        lv_obj_t *cont = lv_menu_cont_create(main_page);
-        lv_obj_t *l    = lv_label_create(cont);
-        lv_label_set_text(l, LV_SYMBOL_POWER "  Auto-dim");
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
-        lv_menu_set_load_page_event(menu, cont, p_dim);
+        lv_menu_set_load_page_event(menu, cont, rows[i].page);
     }
 
     lv_menu_set_page(menu, main_page);
@@ -1772,6 +2143,7 @@ static void build_main_ui(const char *status_text)
     lv_obj_set_style_pad_hor(fps_label, 3, 0);
     lv_obj_align(fps_label, LV_ALIGN_TOP_LEFT, 4, 4);
     lv_obj_clear_flag(fps_label, LV_OBJ_FLAG_CLICKABLE);
+    if (!g_cfg.show_fps) lv_obj_add_flag(fps_label, LV_OBJ_FLAG_HIDDEN);
 
     if (!fps_timer_created) {
         lv_timer_create(fps_timer_cb, 3000, NULL);
@@ -1883,6 +2255,7 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "[8/9] Audio (audio_min: ES8311 + I2S)");
     if (audio_min_init() == ESP_OK) {
+        audio_min_set_volume(g_cfg.audio_volume);
         pos += snprintf(status + pos, sizeof(status) - pos, "Audio OK\n");
     } else {
         pos += snprintf(status + pos, sizeof(status) - pos, "Audio FAIL\n");
@@ -1952,14 +2325,20 @@ extern "C" void app_main(void)
        city; localtime_r() now returns local wall-clock for the clock face. */
     tz_apply_current();
 
+    /* Bring up Wi-Fi *before* the LVGL widget tree is built. esp_wifi_init
+       needs ~5 DMA-capable rx buffers from internal RAM; with ~250 KiB total
+       and the menu's many sub-pages it ran out of buffers if we initialised
+       LVGL first. The connect itself still happens later. */
+    wifi_init_once();
+
     show_main_ui(status);
     ESP_LOGI(TAG, "===== All drivers initialized =====");
 
-    /* Auto-connect at boot using whatever NVS has stored. If both
-       NVS and the compiled-in defaults are empty, skip -- the user
-       will set up Wi-Fi once via the settings tile, after which NVS
-       remembers it. */
-    {
+    /* Auto-connect at boot using whatever NVS has stored, unless the
+       user disabled it in Settings. */
+    if (!g_cfg.wifi_autoconnect) {
+        ESP_LOGI(TAG, "auto-connect: disabled in settings");
+    } else {
         if (!g_cfg.last_ssid[0] && DEFAULT_WIFI_SSID[0]) {
             strncpy(g_cfg.last_ssid, DEFAULT_WIFI_SSID,
                     sizeof(g_cfg.last_ssid) - 1);

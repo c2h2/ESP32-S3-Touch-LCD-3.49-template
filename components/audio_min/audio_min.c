@@ -31,6 +31,14 @@ static i2c_master_dev_handle_t es8311_dev = NULL;
 static i2s_chan_handle_t       i2s_tx     = NULL;
 static TaskHandle_t            midi_task  = NULL;
 static volatile bool           is_playing = false;
+static volatile uint16_t       sw_gain_q8 = 256; /* Q8.8 fixed: 256 = unity */
+
+void audio_min_set_volume(uint8_t vol_0_100)
+{
+    if (vol_0_100 > 100) vol_0_100 = 100;
+    /* Linear 0..100 -> 0..256 (Q8.8). 100 = unity, 0 = silent. */
+    sw_gain_q8 = (uint16_t)(((uint32_t)vol_0_100 * 256u + 50u) / 100u);
+}
 
 /* --- ES8311 register helpers --- */
 static esp_err_t es_w(uint8_t reg, uint8_t val)
@@ -136,7 +144,8 @@ static void render_square(int16_t *buf, int n_samples, float freq, float amp)
         return;
     }
     float step = freq / (float)SAMPLE_RATE;
-    int16_t hi = (int16_t)(amp * 12000.0f);
+    int32_t g  = (int32_t)sw_gain_q8;       /* Q8.8 software volume */
+    int16_t hi = (int16_t)((int32_t)(amp * 12000.0f) * g / 256);
     int16_t lo = -hi;
     for (int i = 0; i < n_samples; i++) {
         int16_t v = (phase < 0.5f) ? hi : lo;
