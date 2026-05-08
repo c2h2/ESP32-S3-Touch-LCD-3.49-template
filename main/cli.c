@@ -93,6 +93,27 @@ static struct {
     struct arg_end *end;
 } s_play_args;
 
+static struct {
+    struct arg_str *ssid;
+    struct arg_str *pass;
+    struct arg_end *end;
+} s_wifi_connect_args;
+
+static int cmd_wifi_connect(int argc, char **argv)
+{
+    int n = arg_parse(argc, argv, (void **)&s_wifi_connect_args);
+    if (n != 0) {
+        arg_print_errors(stderr, s_wifi_connect_args.end, "wifi_connect");
+        return 1;
+    }
+    const char *ssid = s_wifi_connect_args.ssid->sval[0];
+    const char *pass = (s_wifi_connect_args.pass->count > 0)
+                        ? s_wifi_connect_args.pass->sval[0] : "";
+    printf("wifi_connect: ssid=%s pass_len=%u\n", ssid, (unsigned)strlen(pass));
+    app_wifi_connect_save(ssid, pass);
+    return 0;
+}
+
 static int cmd_radio_play(int argc, char **argv)
 {
     int n = arg_parse(argc, argv, (void **)&s_play_args);
@@ -186,6 +207,19 @@ void cli_start(void)
         .argtable = &s_play_args,
     };
     esp_console_cmd_register(&play_cmd);
+
+    /* wifi_connect <ssid> [pass]: persist creds + start association. */
+    s_wifi_connect_args.ssid = arg_str1(NULL, NULL, "<ssid>", "Wi-Fi SSID");
+    s_wifi_connect_args.pass = arg_str0(NULL, NULL, "[pass]", "Wi-Fi password (optional for open APs)");
+    s_wifi_connect_args.end  = arg_end(2);
+    const esp_console_cmd_t wcc = {
+        .command  = "wifi_connect",
+        .help     = "save SSID/pass to NVS and connect (e.g. wifi_connect MyAP secret)",
+        .hint     = NULL,
+        .func     = &cmd_wifi_connect,
+        .argtable = &s_wifi_connect_args,
+    };
+    esp_console_cmd_register(&wcc);
 
     if (esp_console_start_repl(repl) != ESP_OK) {
         ESP_LOGE(TAG, "console start failed");

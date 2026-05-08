@@ -907,6 +907,17 @@ static void wifi_connect(const char *ssid, const char *pass)
              (int)wc.sta.threshold.authmode, esp_err_to_name(er));
 }
 
+/* Public helper for cli.c: persist creds and kick a connect attempt. */
+extern "C" void app_wifi_connect_save(const char *ssid, const char *pass)
+{
+    if (!ssid || !*ssid) return;
+    cfg_save_ssid_pass(ssid, pass ? pass : "");
+    strncpy(g_cfg.last_ssid, ssid, sizeof(g_cfg.last_ssid) - 1);
+    g_cfg.last_ssid[sizeof(g_cfg.last_ssid) - 1] = 0;
+    cfg_save();
+    wifi_connect(ssid, pass ? pass : "");
+}
+
 /* ---------------------- SNTP ---------------------- */
 
 /* Re-sync interval (ms). 4 hours by default. */
@@ -1730,6 +1741,12 @@ static void kb_event_cb(lv_event_t *e)
         ESP_LOGI(TAG, "kb: connect ssid=%s pass_len=%u", ssid,
                  (unsigned)strlen(pass_copy));
         cfg_save_ssid_pass(ssid, pass_copy);
+        /* Promote this SSID to "last_ssid" so auto-connect picks it up on
+           the next boot. Without this the password gets stored but the
+           auto-connect path logs "no credentials yet". */
+        strncpy(g_cfg.last_ssid, ssid, sizeof(g_cfg.last_ssid) - 1);
+        g_cfg.last_ssid[sizeof(g_cfg.last_ssid) - 1] = 0;
+        cfg_save();
         wifi_connect(ssid, pass_copy);
         if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ssid);
         kb_close();
@@ -1739,6 +1756,62 @@ static void kb_event_cb(lv_event_t *e)
         (void)kb;
     }
 }
+
+/* Mac-style 5-row keymap: digit row always visible, QWERTY, ASDF, ZXCV with
+   punctuation, then a compact bottom row with a narrower space bar so we
+   have room for "1#" (-> symbols mode), arrows, "_", "-" and OK.
+   Magic strings ("ABC", "abc", "1#") are recognised by lv_keyboard for
+   mode toggles -- everything else types literally.
+   Width units sum per row; LVGL renders each button proportionally. */
+static const char *kKbMapLower[] = {
+    /* row 1: 10 digits + backspace(2)  -> 12 */
+    "1","2","3","4","5","6","7","8","9","0", LV_SYMBOL_BACKSPACE, "\n",
+    /* row 2: 10 letters                 -> 10 */
+    "q","w","e","r","t","y","u","i","o","p", "\n",
+    /* row 3: 9 letters                  -> 9 */
+    "a","s","d","f","g","h","j","k","l", "\n",
+    /* row 4: shift(1.5) + 7 letters + , + .  -> 11.5 */
+    "ABC", "z","x","c","v","b","n","m",",",".", "\n",
+    /* row 5: 1#(2) + @ + . + left + space(4) + right + _ + - + OK(2) -> 13 */
+    "1#", "@",".", LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, "_","-", LV_SYMBOL_OK, ""
+};
+/* Widths (per button) for kKbMapLower. CTRL_BTN_FLAGS marks a control key
+   that isn't inserted as text. CLICK_TRIG | NO_REPEAT on character keys
+   makes them fire on release only and disables auto-repeat -- prevents
+   "caaaattt" from a slightly-too-long press or a jittery touch. Backspace
+   keeps default behaviour so hold-to-delete still works. */
+#define KB_CHAR  (LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT | 1)
+#define KB_CTRL2 (LV_KEYBOARD_CTRL_BTN_FLAGS | LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT | 2)
+#define KB_CTRL1 (LV_KEYBOARD_CTRL_BTN_FLAGS | LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT | 1)
+static const lv_btnmatrix_ctrl_t kKbCtrlLower[] = {
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 2,  /* backspace: auto-repeat allowed */
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    LV_BTNMATRIX_CTRL_CHECKED | KB_CTRL2,
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    KB_CTRL2, KB_CHAR, KB_CHAR,
+    KB_CTRL1, 4 | LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT, KB_CTRL1,
+    KB_CHAR, KB_CHAR, KB_CTRL2,
+};
+static const char *kKbMapUpper[] = {
+    "1","2","3","4","5","6","7","8","9","0", LV_SYMBOL_BACKSPACE, "\n",
+    "Q","W","E","R","T","Y","U","I","O","P", "\n",
+    "A","S","D","F","G","H","J","K","L", "\n",
+    "abc", "Z","X","C","V","B","N","M",",",".", "\n",
+    "1#", "@",".", LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, "_","-", LV_SYMBOL_OK, ""
+};
+static const lv_btnmatrix_ctrl_t kKbCtrlUpper[] = {
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 2,
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    LV_BTNMATRIX_CTRL_CHECKED | KB_CTRL2,
+    KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,KB_CHAR,
+    KB_CTRL2, KB_CHAR, KB_CHAR,
+    KB_CTRL1, 4 | LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT, KB_CTRL1,
+    KB_CHAR, KB_CHAR, KB_CTRL2,
+};
 
 static void kb_open_for_ssid(const char *ssid)
 {
@@ -1758,24 +1831,62 @@ static void kb_open_for_ssid(const char *ssid)
     lv_obj_set_style_bg_opa(g_set_kb_overlay, LV_OPA_90, 0);
     lv_obj_clear_flag(g_set_kb_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = lv_label_create(g_set_kb_overlay);
-    lv_label_set_text_fmt(title, "Password for %s", ssid);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 4, 2);
-
+    /* Single-line text area at the top + eye toggle on the right edge.
+       Pad-tight so the keyboard below gets the rest of the canvas. */
+    const int TA_H  = 20;
+    const int EYE_W = 28;
     g_set_kb_ta = lv_textarea_create(g_set_kb_overlay);
     lv_textarea_set_one_line(g_set_kb_ta, true);
     lv_textarea_set_password_mode(g_set_kb_ta, true);
-    lv_textarea_set_placeholder_text(g_set_kb_ta, "Wi-Fi password");
-    lv_obj_set_width(g_set_kb_ta, canvas_w - 8);
-    lv_obj_align(g_set_kb_ta, LV_ALIGN_TOP_LEFT, 4, 18);
+    char ph[64];
+    snprintf(ph, sizeof(ph), "Pass for %s", ssid);
+    lv_textarea_set_placeholder_text(g_set_kb_ta, ph);
+    lv_obj_set_size(g_set_kb_ta, canvas_w - EYE_W, TA_H);
+    lv_obj_align(g_set_kb_ta, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_text_font(g_set_kb_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_pad_top(g_set_kb_ta, 1, 0);
+    lv_obj_set_style_pad_bottom(g_set_kb_ta, 1, 0);
+    lv_obj_set_style_pad_left(g_set_kb_ta, 6, 0);
+    lv_obj_set_style_pad_right(g_set_kb_ta, 6, 0);
+    lv_obj_set_style_border_width(g_set_kb_ta, 0, 0);
+    lv_obj_set_style_radius(g_set_kb_ta, 0, 0);
+
+    /* Eye toggle: tap to show/hide the password text. Defaults to hidden
+       (eye-closed glyph), since the textarea boots in password mode. */
+    lv_obj_t *eye = lv_btn_create(g_set_kb_overlay);
+    lv_obj_set_size(eye, EYE_W, TA_H);
+    lv_obj_align(eye, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_radius(eye, 0, 0);
+    lv_obj_set_style_pad_all(eye, 0, 0);
+    lv_obj_set_style_bg_color(eye, lv_color_make(0x30, 0x30, 0x40), 0);
+    lv_obj_t *eye_lbl = lv_label_create(eye);
+    lv_label_set_text(eye_lbl, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_set_style_text_color(eye_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(eye_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(eye_lbl);
+    lv_obj_add_event_cb(eye, [](lv_event_t *e) {
+        lv_obj_t *btn = lv_event_get_target(e);
+        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+        if (!g_set_kb_ta) return;
+        bool was_pw = lv_textarea_get_password_mode(g_set_kb_ta);
+        lv_textarea_set_password_mode(g_set_kb_ta, !was_pw);
+        if (lbl) lv_label_set_text(lbl, was_pw ? LV_SYMBOL_EYE_OPEN
+                                               : LV_SYMBOL_EYE_CLOSE);
+    }, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *kb = lv_keyboard_create(g_set_kb_overlay);
     lv_obj_set_width(kb, canvas_w);
-    lv_obj_set_height(kb, canvas_h - 48);
+    lv_obj_set_height(kb, canvas_h - TA_H);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    /* Tight padding inside the keyboard so each row gets more vertical
+       space; gives ~30 px tall keys on the 172 px canvas. */
+    lv_obj_set_style_pad_all(kb, 2, 0);
+    lv_obj_set_style_pad_row(kb, 2, 0);
+    lv_obj_set_style_pad_column(kb, 2, 0);
+    lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_LOWER,
+                        (const char **)kKbMapLower, kKbCtrlLower);
+    lv_keyboard_set_map(kb, LV_KEYBOARD_MODE_TEXT_UPPER,
+                        (const char **)kKbMapUpper, kKbCtrlUpper);
     lv_keyboard_set_textarea(kb, g_set_kb_ta);
     lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_READY,  NULL);
     lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_CANCEL, NULL);
@@ -1794,12 +1905,18 @@ static void wifi_ap_clicked_cb(lv_event_t *e)
        (auth=0) connect with empty password. */
     if (ap->auth == 0) {
         cfg_save_ssid_pass(ap->ssid, "");
+        strncpy(g_cfg.last_ssid, ap->ssid, sizeof(g_cfg.last_ssid) - 1);
+        g_cfg.last_ssid[sizeof(g_cfg.last_ssid) - 1] = 0;
+        cfg_save();
         wifi_connect(ap->ssid, "");
         if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ap->ssid);
         return;
     }
     char pass[65] = {0};
     if (cfg_get_ssid_pass(ap->ssid, pass, sizeof(pass))) {
+        strncpy(g_cfg.last_ssid, ap->ssid, sizeof(g_cfg.last_ssid) - 1);
+        g_cfg.last_ssid[sizeof(g_cfg.last_ssid) - 1] = 0;
+        cfg_save();
         wifi_connect(ap->ssid, pass);
         if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ap->ssid);
         return;
