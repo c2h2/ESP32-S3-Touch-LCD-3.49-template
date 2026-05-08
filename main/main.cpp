@@ -1,5 +1,8 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -51,7 +54,19 @@ static int               canvas_w        = UI_CANVAS_W;  /* 640 */
 static int               canvas_h        = UI_CANVAS_H;  /* 172 */
 static lv_disp_drv_t    *g_disp_drv      = NULL;
 static char              g_status_text[256];
-static void show_hello_world(const char *status_text);
+
+/* Tileview-based UI: hello | clock (start) | sunmap. Swipe horizontally. */
+static lv_obj_t  *g_tileview         = NULL;
+static lv_obj_t  *g_clock_time_label = NULL;
+static lv_obj_t  *g_clock_date_label = NULL;
+static lv_obj_t  *g_sunmap_canvas    = NULL;
+static lv_color_t *g_sunmap_buf      = NULL;
+static int        g_sunmap_w         = 0;
+static int        g_sunmap_h         = 0;
+static lv_timer_t *g_clock_timer     = NULL;
+static lv_timer_t *g_sunmap_timer    = NULL;
+
+static void show_main_ui(const char *status_text);
 
 static const axs15231b_lcd_init_cmd_t lcd_init_cmds[] = {
     {0x11, (uint8_t []){0x00}, 0, 100},
@@ -488,23 +503,291 @@ static void rotate_btn_event_cb(lv_event_t *e)
     lv_obj_clean(lv_scr_act());
     fps_label = NULL;
     play_btn_label = NULL;
-    show_hello_world(g_status_text);
+    g_tileview = NULL;
+    g_clock_time_label = NULL;
+    g_clock_date_label = NULL;
+    g_sunmap_canvas = NULL;
+    if (g_clock_timer)  { lv_timer_del(g_clock_timer);  g_clock_timer  = NULL; }
+    if (g_sunmap_timer) { lv_timer_del(g_sunmap_timer); g_sunmap_timer = NULL; }
+    show_main_ui(g_status_text);
     ESP_LOGI(TAG, "rotate -> %d deg  canvas=%dx%d", rot_state * 90, canvas_w, canvas_h);
 }
 
-static void build_hello_world_ui(const char *status_text)
+/* ---------------------- Clock tile ---------------------- */
+
+static void get_display_time(struct tm *out)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    time_t t = tv.tv_sec + (time_t)(TZ_OFFSET_HOURS * 3600);
+    gmtime_r(&t, out);
+}
+
+static void clock_update_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!g_clock_time_label || !g_clock_date_label) return;
+    struct tm tm;
+    get_display_time(&tm);
+    char buf[64];
+    int yyyy = tm.tm_year + 1900;
+    int mm   = tm.tm_mon + 1;
+    int dd   = tm.tm_mday;
+    if (yyyy < 0) yyyy = 0;
+    if (yyyy > 9999) yyyy = 9999;
+    if (mm < 1) mm = 1;
+    if (mm > 12) mm = 12;
+    if (dd < 1) dd = 1;
+    if (dd > 31) dd = 31;
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", yyyy, mm, dd);
+    lv_label_set_text(g_clock_date_label, buf);
+    int hh = tm.tm_hour, mi = tm.tm_min, ss = tm.tm_sec;
+    if (hh < 0) hh = 0;
+    if (hh > 23) hh = 23;
+    if (mi < 0) mi = 0;
+    if (mi > 59) mi = 59;
+    if (ss < 0) ss = 0;
+    if (ss > 60) ss = 60;
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hh, mi, ss);
+    lv_label_set_text(g_clock_time_label, buf);
+}
+
+static void build_clock_tile(lv_obj_t *parent)
+{
+    lv_obj_set_style_bg_color(parent, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+
+    g_clock_date_label = lv_label_create(parent);
+    lv_label_set_text(g_clock_date_label, "----.--.--");
+    lv_obj_set_style_text_color(g_clock_date_label, lv_color_make(0xa0, 0xa0, 0xa0), 0);
+    lv_obj_set_style_text_font(g_clock_date_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(g_clock_date_label, LV_ALIGN_TOP_MID, 0, 8);
+
+    g_clock_time_label = lv_label_create(parent);
+    lv_label_set_text(g_clock_time_label, "--:--:--");
+    lv_obj_set_style_text_color(g_clock_time_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(g_clock_time_label, &lv_font_montserrat_48, 0);
+    lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER, 0, 16);
+
+    lv_obj_t *tz = lv_label_create(parent);
+    lv_label_set_text_fmt(tz, "UTC%+d", TZ_OFFSET_HOURS);
+    lv_obj_set_style_text_color(tz, lv_color_make(0x60, 0x60, 0x60), 0);
+    lv_obj_set_style_text_font(tz, &lv_font_montserrat_12, 0);
+    lv_obj_align(tz, LV_ALIGN_BOTTOM_RIGHT, -8, -4);
+
+    if (!g_clock_timer) {
+        g_clock_timer = lv_timer_create(clock_update_cb, 500, NULL);
+    }
+    clock_update_cb(NULL);
+}
+
+/* ---------------------- Sunmap tile ---------------------- */
+
+/* Approximate continent outlines as polylines drawn into the canvas.
+   Coordinates are normalized lon[-180..180], lat[-90..90] and converted
+   to canvas pixels at draw time. Detail level chosen for ~360x120 maps. */
+typedef struct { float lon, lat; } sun_pt_t;
+typedef struct {
+    const sun_pt_t *pts;
+    int             n;
+} sun_poly_t;
+
+/* Hand-tuned coarse landmass outlines. Not cartographically accurate,
+   but distinguishable as continents at low resolution. */
+static const sun_pt_t k_eurasia[] = {
+    {-10, 36},{ 5, 43},{ 12, 45},{ 25, 41},{ 30, 37},{ 35, 34},
+    { 45, 41},{ 60, 42},{ 75, 40},{ 90, 35},{105, 33},{120, 35},
+    {135, 45},{145, 55},{155, 65},{165, 70},{175, 72},
+    {175, 78},{120, 78},{ 80, 78},{ 40, 75},{ 20, 70},{  5, 60},
+    {-10, 55},{-10, 45}
+};
+static const sun_pt_t k_africa[] = {
+    {-17, 33},{-10, 22},{ -5, 14},{  0,  5},{  5, -5},{ 12,-15},
+    { 18,-25},{ 22,-30},{ 28,-32},{ 35,-25},{ 40,-15},{ 45, -8},
+    { 51, 12},{ 43, 12},{ 35, 22},{ 25, 30},{ 12, 33},{  0, 36},
+    {-10, 35},{-17, 33}
+};
+static const sun_pt_t k_n_america[] = {
+    {-160, 70},{-140, 72},{-120, 70},{-100, 65},{ -80, 62},{ -60, 60},
+    { -55, 50},{ -65, 45},{ -75, 38},{ -82, 28},{ -97, 25},{-105, 30},
+    {-117, 32},{-125, 40},{-135, 55},{-150, 60},{-165, 65},{-160, 70}
+};
+static const sun_pt_t k_s_america[] = {
+    {-80, 10},{-70,  5},{-60, -2},{-50, -5},{-40,-10},{-38,-22},
+    {-50,-35},{-60,-45},{-72,-52},{-72,-40},{-78,-25},{-82,-10},
+    {-80, 10}
+};
+static const sun_pt_t k_australia[] = {
+    {115,-22},{125,-15},{140,-12},{150,-22},{152,-32},{145,-38},
+    {130,-35},{118,-30},{115,-22}
+};
+static const sun_pt_t k_antarctica[] = {
+    {-180,-78},{-90,-72},{ 0,-70},{ 90,-72},{180,-78},{180,-90},{-180,-90},{-180,-78}
+};
+
+static const sun_poly_t k_continents[] = {
+    { k_eurasia,    sizeof(k_eurasia)   /sizeof(sun_pt_t) },
+    { k_africa,     sizeof(k_africa)    /sizeof(sun_pt_t) },
+    { k_n_america,  sizeof(k_n_america) /sizeof(sun_pt_t) },
+    { k_s_america,  sizeof(k_s_america) /sizeof(sun_pt_t) },
+    { k_australia,  sizeof(k_australia) /sizeof(sun_pt_t) },
+    { k_antarctica, sizeof(k_antarctica)/sizeof(sun_pt_t) },
+};
+
+/* Even-odd polygon fill into the canvas buffer. */
+static void sunmap_fill_poly(lv_color_t *buf, int W, int H,
+                              const sun_pt_t *pts, int n,
+                              lv_color_t color)
+{
+    /* Build per-row x-intersection lists. */
+    for (int y = 0; y < H; y++) {
+        float lat = 90.0f - (y + 0.5f) * (180.0f / H);
+        float xs[16];
+        int   nx = 0;
+        for (int i = 0; i < n - 1; i++) {
+            float la = pts[i].lat,     lo_a = pts[i].lon;
+            float lb = pts[i+1].lat,   lo_b = pts[i+1].lon;
+            if ((la > lat) != (lb > lat)) {
+                float t = (lat - la) / (lb - la);
+                float lon = lo_a + t * (lo_b - lo_a);
+                if (nx < (int)(sizeof(xs)/sizeof(xs[0]))) xs[nx++] = lon;
+            }
+        }
+        /* sort xs */
+        for (int i = 1; i < nx; i++) {
+            float v = xs[i]; int j = i - 1;
+            while (j >= 0 && xs[j] > v) { xs[j+1] = xs[j]; j--; }
+            xs[j+1] = v;
+        }
+        for (int i = 0; i + 1 < nx; i += 2) {
+            int x0 = (int)((xs[i]   + 180.0f) / 360.0f * W);
+            int x1 = (int)((xs[i+1] + 180.0f) / 360.0f * W);
+            if (x0 < 0) x0 = 0;
+            if (x1 > W) x1 = W;
+            for (int x = x0; x < x1; x++) buf[y * W + x] = color;
+        }
+    }
+}
+
+static void sunmap_redraw(void)
+{
+    if (!g_sunmap_buf || !g_sunmap_canvas) return;
+    const int W = g_sunmap_w;
+    const int H = g_sunmap_h;
+    const lv_color_t c_night     = lv_color_black();
+    const lv_color_t c_land_n    = lv_color_make(0x40, 0x40, 0x40);
+    const lv_color_t c_land_d    = lv_color_make(0x90, 0x90, 0x90);
+    const lv_color_t c_water_d   = lv_color_make(0x20, 0x20, 0x20);
+
+    /* 1. Fill night background. */
+    for (int i = 0; i < W * H; i++) g_sunmap_buf[i] = c_night;
+
+    /* 2. Compute subsolar point in radians. */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    time_t now = tv.tv_sec;
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    int doy = tm.tm_yday;  /* 0..365 */
+    float utc_hours = tm.tm_hour + tm.tm_min / 60.0f + tm.tm_sec / 3600.0f;
+    float sun_lon_deg = -15.0f * (utc_hours - 12.0f);
+    float sun_lat_deg = 23.44f * sinf(2.0f * (float)M_PI * (doy - 81) / 365.0f);
+    float sl = sun_lat_deg * (float)M_PI / 180.0f;
+    float so = sun_lon_deg * (float)M_PI / 180.0f;
+
+    /* 3. Light water (day side) where sun above horizon. */
+    for (int y = 0; y < H; y++) {
+        float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
+        float sin_lat_p = sinf(lat);
+        float cos_lat_p = cosf(lat);
+        for (int x = 0; x < W; x++) {
+            float lon = (-180.0f + (x + 0.5f) * (360.0f / W)) * (float)M_PI / 180.0f;
+            float c = sinf(sl) * sin_lat_p + cosf(sl) * cos_lat_p * cosf(lon - so);
+            if (c > 0) g_sunmap_buf[y * W + x] = c_water_d;
+        }
+    }
+
+    /* 4. Draw continents: night = mid-grey, day = lighter. We do it per
+       continent in two passes: first fill polygon over the buffer with a
+       sentinel marker, then re-evaluate the day/night for those pixels. */
+    /* Simpler: fill with mid-grey, then re-light the day pixels above. */
+    for (size_t i = 0; i < sizeof(k_continents)/sizeof(k_continents[0]); i++) {
+        sunmap_fill_poly(g_sunmap_buf, W, H,
+                         k_continents[i].pts, k_continents[i].n, c_land_n);
+    }
+    /* Re-light day-side land pixels. */
+    for (int y = 0; y < H; y++) {
+        float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
+        float sin_lat_p = sinf(lat);
+        float cos_lat_p = cosf(lat);
+        for (int x = 0; x < W; x++) {
+            lv_color_t *p = &g_sunmap_buf[y * W + x];
+            if (p->full == c_land_n.full) {
+                float lon = (-180.0f + (x + 0.5f) * (360.0f / W)) * (float)M_PI / 180.0f;
+                float c = sinf(sl) * sin_lat_p + cosf(sl) * cos_lat_p * cosf(lon - so);
+                if (c > 0) *p = c_land_d;
+            }
+        }
+    }
+
+    lv_obj_invalidate(g_sunmap_canvas);
+}
+
+static void sunmap_update_cb(lv_timer_t *t)
+{
+    (void)t;
+    sunmap_redraw();
+}
+
+static void build_sunmap_tile(lv_obj_t *parent)
+{
+    lv_obj_set_style_bg_color(parent, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Map size: ~3:1 aspect equirectangular, fit inside canvas with margin. */
+    int margin = 16;
+    int max_w = canvas_w - 2 * margin;
+    int max_h = canvas_h - 2 * margin - 16;
+    int W = max_w;
+    int H = W / 3;
+    if (H > max_h) { H = max_h; W = H * 3; }
+
+    g_sunmap_w = W;
+    g_sunmap_h = H;
+    if (g_sunmap_buf) { lv_mem_free(g_sunmap_buf); g_sunmap_buf = NULL; }
+    g_sunmap_buf = (lv_color_t *)lv_mem_alloc((size_t)W * H * sizeof(lv_color_t));
+    if (!g_sunmap_buf) return;
+
+    g_sunmap_canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(g_sunmap_canvas, g_sunmap_buf, W, H, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_align(g_sunmap_canvas, LV_ALIGN_CENTER, 0, -4);
+
+    lv_obj_t *cap = lv_label_create(parent);
+    lv_label_set_text(cap, "World daylight  (UTC)");
+    lv_obj_set_style_text_color(cap, lv_color_make(0x80, 0x80, 0x80), 0);
+    lv_obj_set_style_text_font(cap, &lv_font_montserrat_12, 0);
+    lv_obj_align(cap, LV_ALIGN_BOTTOM_MID, 0, -4);
+
+    sunmap_redraw();
+    if (!g_sunmap_timer) {
+        g_sunmap_timer = lv_timer_create(sunmap_update_cb, SUNMAP_RECOMPUTE_MS, NULL);
+    }
+}
+
+/* ---------------------- Hello tile (legacy demo) ---------------------- */
+
+static void build_hello_tile(lv_obj_t *parent, const char *status_text)
 {
     static bool fps_timer_created = false;
 
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(parent, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *hello = lv_label_create(scr);
+    lv_obj_t *hello = lv_label_create(parent);
     lv_label_set_long_mode(hello, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    /* Force the label narrower than its text so it actually scrolls;
-       a non-scrolling label means LVGL has nothing to redraw and FPS
-       drops to whatever else happens to invalidate (the FPS counter). */
     lv_obj_set_width(hello, canvas_w / 3);
     lv_label_set_text(hello, "Hello World  *  Hello World  *  Hello World  *  ");
     lv_obj_set_style_text_color(hello, lv_color_white(), 0);
@@ -513,13 +796,13 @@ static void build_hello_world_ui(const char *status_text)
     lv_obj_set_style_text_align(hello, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_align(hello, LV_ALIGN_TOP_MID, 0, 8);
 
-    fps_label = lv_label_create(scr);
+    fps_label = lv_label_create(parent);
     lv_label_set_text(fps_label, "FPS --");
     lv_obj_set_style_text_color(fps_label, lv_color_make(0x00, 0xff, 0x80), 0);
     lv_obj_set_style_text_font(fps_label, &lv_font_montserrat_12, 0);
     lv_obj_align(fps_label, LV_ALIGN_TOP_RIGHT, -4, 4);
 
-    lv_obj_t *status = lv_label_create(scr);
+    lv_obj_t *status = lv_label_create(parent);
     lv_label_set_long_mode(status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(status, canvas_w - 20);
     lv_label_set_text(status, status_text);
@@ -529,7 +812,7 @@ static void build_hello_world_ui(const char *status_text)
     lv_obj_align(status, LV_ALIGN_CENTER, 0, 0);
 
     /* Play / Stop button */
-    lv_obj_t *play_btn = lv_btn_create(scr);
+    lv_obj_t *play_btn = lv_btn_create(parent);
     lv_obj_set_size(play_btn, 50, 50);
     lv_obj_align(play_btn, LV_ALIGN_BOTTOM_LEFT, 16, -8);
     lv_obj_set_style_radius(play_btn, 25, 0);
@@ -542,7 +825,7 @@ static void build_hello_world_ui(const char *status_text)
     lv_obj_center(play_btn_label);
 
     /* Rotate button */
-    lv_obj_t *rot_btn = lv_btn_create(scr);
+    lv_obj_t *rot_btn = lv_btn_create(parent);
     lv_obj_set_size(rot_btn, 50, 50);
     lv_obj_align(rot_btn, LV_ALIGN_BOTTOM_RIGHT, -16, -8);
     lv_obj_set_style_radius(rot_btn, 30, 0);
@@ -560,18 +843,42 @@ static void build_hello_world_ui(const char *status_text)
     }
 }
 
-static void show_hello_world(const char *status_text)
+/* ---------------------- Top-level UI builder ---------------------- */
+
+static void build_main_ui(const char *status_text)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    g_tileview = lv_tileview_create(scr);
+    lv_obj_set_size(g_tileview, canvas_w, canvas_h);
+    lv_obj_set_style_bg_color(g_tileview, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_tileview, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(g_tileview, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *t_hello  = lv_tileview_add_tile(g_tileview, 0, 0, LV_DIR_RIGHT);
+    lv_obj_t *t_clock  = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    lv_obj_t *t_sunmap = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT);
+
+    build_hello_tile (t_hello,  status_text);
+    build_clock_tile (t_clock);
+    build_sunmap_tile(t_sunmap);
+
+    /* Start on the clock. */
+    lv_obj_set_tile_id(g_tileview, 1, 0, LV_ANIM_OFF);
+}
+
+static void show_main_ui(const char *status_text)
 {
     /* Cache for redraw on rotation. */
     if (status_text != g_status_text) {
         strncpy(g_status_text, status_text, sizeof(g_status_text) - 1);
         g_status_text[sizeof(g_status_text) - 1] = '\0';
     }
-    /* If we're already inside the LVGL task (e.g. rebuilding from a button
-       event), the mutex is already held; re-locking would deadlock. */
     bool need_lock = (xSemaphoreGetMutexHolder(lvgl_mux) != xTaskGetCurrentTaskHandle());
     if (need_lock && !lvgl_lock(-1)) return;
-    build_hello_world_ui(g_status_text);
+    build_main_ui(g_status_text);
     if (need_lock) lvgl_unlock();
 }
 
@@ -643,7 +950,29 @@ extern "C" void app_main(void)
     button_Init();
     pos += snprintf(status + pos, sizeof(status) - pos, "SD/Btn OK");
 
-    show_hello_world(status);
+    /* Seed system time from the PCF85063 RTC so gettimeofday() returns
+       wall-clock UTC. The RTC's stored time is treated as UTC; the
+       display layer applies TZ_OFFSET_HOURS at format time. setenv TZ=UTC
+       so mktime treats the broken-down time as UTC. */
+    {
+        RtcDateTime_t r = i2c_rtc_get();
+        setenv("TZ", "UTC0", 1);
+        tzset();
+        struct tm tm = {};
+        tm.tm_year = (int)r.year - 1900;
+        tm.tm_mon  = (int)r.month - 1;
+        tm.tm_mday = r.day;
+        tm.tm_hour = r.hour;
+        tm.tm_min  = r.minute;
+        tm.tm_sec  = r.second;
+        time_t t = mktime(&tm);
+        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "RTC seed: %04d-%02d-%02d %02d:%02d:%02d UTC -> epoch %lld",
+                 r.year, r.month, r.day, r.hour, r.minute, r.second, (long long)t);
+    }
+
+    show_main_ui(status);
     ESP_LOGI(TAG, "===== All drivers initialized =====");
 
     uint32_t heartbeat = 0;
