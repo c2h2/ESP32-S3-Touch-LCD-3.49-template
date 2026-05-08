@@ -37,6 +37,7 @@
 #include "sdcard_bsp.h"
 #include "button_bsp.h"
 #include "audio_min.h"
+#include "landmask.h"
 
 static const char *TAG = "skeleton";
 
@@ -1136,244 +1137,23 @@ static void build_clock_tile(lv_obj_t *parent)
 
 /* ---------------------- Sunmap tile ---------------------- */
 
-/* Approximate continent outlines as polylines drawn into the canvas.
-   Coordinates are normalized lon[-180..180], lat[-90..90] and converted
-   to canvas pixels at draw time. Detail level chosen for ~360x120 maps. */
-typedef struct { float lon, lat; } sun_pt_t;
-typedef struct {
-    const sun_pt_t *pts;
-    int             n;
-} sun_poly_t;
-
-/* Denser hand-tuned continent outlines. Coordinates are (lon, lat) in
-   degrees. Each polygon is closed (first vertex repeated at end). Not
-   cartographically precise but capture enough features (UK, Iberia,
-   Italy, Scandinavia, Arabia, India, Korea, Indochina, Florida, Gulf
-   of Mexico, Hudson Bay, Greenland, Madagascar, Japan, NZ, Indonesia)
-   to be recognizable at ~580x130 pixels. */
-
-/* Eurasia main mass (without UK, Japan, Indonesia, etc.). */
-static const sun_pt_t k_eurasia[] = {
-    /* Iberia */
-    { -9, 43},{ -9, 38},{ -7, 37},{ -3, 36},{  0, 38},{  3, 42},
-    /* France/Italy */
-    {  4, 43},{  7, 44},{  9, 44},{ 12, 45},{ 14, 41},{ 18, 40},
-    { 17, 38},{ 15, 37},{ 13, 38},{ 12, 44},{ 14, 45},{ 16, 46},
-    /* Balkans/Black Sea */
-    { 19, 42},{ 23, 41},{ 28, 41},{ 30, 41},{ 31, 45},{ 36, 45},
-    { 37, 42},{ 36, 36},{ 35, 35},
-    /* Levant/Arabia (part of Asia) */
-    { 36, 32},{ 35, 31},{ 34, 30},{ 32, 30},{ 33, 28},{ 35, 25},
-    { 38, 23},{ 42, 18},{ 44, 14},{ 49, 12},{ 52, 16},{ 54, 17},
-    { 56, 25},{ 50, 27},{ 48, 30},{ 50, 30},{ 56, 27},{ 60, 25},
-    /* Iran/Pakistan */
-    { 62, 25},{ 67, 25},{ 67, 24},{ 68, 23},
-    /* India */
-    { 72, 23},{ 73, 17},{ 78, 11},{ 78,  8},{ 80,  9},{ 80, 13},
-    { 82, 17},{ 87, 21},{ 89, 22},{ 92, 22},{ 91, 25},
-    /* Indochina (mainland) */
-    { 95, 22},{ 99, 16},{102, 10},{105, 10},{108, 10},{109, 14},
-    {107, 17},{109, 21},
-    /* China east coast */
-    {110, 22},{114, 23},{117, 24},{121, 28},{121, 32},{122, 37},
-    {120, 39},{122, 41},
-    /* Korea */
-    {126, 35},{127, 38},{129, 39},{128, 42},{130, 43},
-    /* NE Asia/Russia far east */
-    {131, 45},{135, 49},{140, 53},{144, 57},{152, 60},{160, 62},
-    {170, 65},{180, 68},{180, 72},
-    /* Russia north coast (Arctic) */
-    {165, 72},{140, 75},{105, 78},{ 80, 78},{ 60, 76},{ 40, 73},
-    {  20, 72},
-    /* Scandinavia */
-    { 18, 70},{ 14, 68},{ 12, 65},{  6, 62},{  5, 58},{ 10, 56},
-    /* Baltic / NW Europe */
-    { 12, 54},{  9, 53},{  6, 53},{  4, 51},{  0, 50},{ -1, 49},
-    { -4, 48},{ -5, 44},{ -9, 43}
-};
-
-/* British Isles, simplified. */
-static const sun_pt_t k_uk[] = {
-    { -5, 58},{ -3, 59},{ -1, 58},{  1, 56},{  1, 53},{  0, 51},
-    { -2, 50},{ -5, 50},{ -5, 53},{ -3, 55},{ -5, 58}
-};
-
-/* Japan, four-island silhouette as a single polygon. */
-static const sun_pt_t k_japan[] = {
-    {130, 31},{132, 33},{134, 34},{137, 35},{139, 35},{141, 39},
-    {142, 42},{145, 44},{144, 41},{141, 38},{138, 36},{135, 34},
-    {133, 32},{131, 31},{130, 31}
-};
-
-/* Indonesia: a simplified blob covering Sumatra+Java+Borneo+Sulawesi. */
-static const sun_pt_t k_indonesia[] = {
-    { 95,  5},{ 99,  3},{105, -2},{110, -7},{114, -8},{120, -8},
-    {125, -8},{130, -5},{132, -2},{128,  0},{124,  3},{118,  5},
-    {115,  4},{112,  2},{108, -3},{104, -1},{100,  3},{ 95,  5}
-};
-
-/* New Guinea + nearby. */
-static const sun_pt_t k_newguinea[] = {
-    {130, -2},{135, -3},{140, -3},{146, -6},{151, -8},{148, -10},
-    {142, -10},{137, -8},{132, -5},{130, -2}
-};
-
-/* Africa main mass. */
-static const sun_pt_t k_africa[] = {
-    {-17, 33},{-12, 28},{ -8, 22},{ -3, 18},{  0, 14},{  3,  8},
-    {  8,  5},{  9,  4},{  9,  2},{ 10,  0},{ 12, -3},{ 14, -8},
-    { 13,-13},{ 12,-17},{ 16,-23},{ 19,-28},{ 23,-32},{ 25,-34},
-    { 30,-32},{ 32,-29},{ 32,-25},{ 35,-22},{ 39,-15},{ 41,-11},
-    { 41, -2},{ 42,  3},{ 45,  9},{ 48, 11},{ 51, 12},{ 50,  9},
-    { 44,  4},{ 42, -3},{ 36, 13},{ 33, 22},{ 30, 26},{ 34, 31},
-    { 32, 32},{ 25, 32},{ 18, 31},{ 11, 33},{  3, 35},{ -3, 35},
-    {-10, 34},{-17, 33}
-};
-
-/* Madagascar. */
-static const sun_pt_t k_madagascar[] = {
-    { 46, -16},{ 49, -13},{ 50, -16},{ 50, -22},{ 47, -25},
-    { 44, -22},{ 44, -19},{ 46, -16}
-};
-
-/* North America main mass. */
-static const sun_pt_t k_n_america[] = {
-    /* Aleutian/Alaska south */
-    {-170, 53},{-155, 56},{-150, 60},{-141, 60},
-    /* Alaska north */
-    {-141, 70},{-156, 71},{-165, 68},
-    /* Canada arctic */
-    {-160, 72},{-140, 73},{-120, 73},{-100, 75},{ -80, 76},{ -65, 78},
-    /* Hudson Bay / Labrador */
-    { -65, 70},{ -75, 65},{ -85, 60},{ -82, 55},{ -78, 60},{ -76, 58},
-    { -68, 55},{ -55, 53},{ -52, 47},
-    /* East coast / New England */
-    { -60, 47},{ -68, 44},{ -73, 41},{ -75, 38},{ -76, 36},{ -78, 33},
-    /* Florida */
-    { -81, 31},{ -81, 25},{ -83, 27},{ -85, 30},
-    /* Gulf of Mexico */
-    { -90, 29},{ -94, 28},{ -97, 27},{ -97, 26},{ -95, 22},{ -91, 19},
-    /* Mexico east */
-    { -88, 18},{ -88, 16},
-    /* Central America */
-    { -83, 12},{ -82,  8},{ -77,  9},
-    /* Mexico Pacific */
-    { -85, 14},{ -94, 16},{-100, 18},{-105, 22},{-110, 24},{-110, 30},
-    /* US Pacific */
-    {-117, 33},{-122, 38},{-124, 42},{-124, 48},{-127, 50},{-132, 54},
-    {-135, 56},{-145, 60},{-155, 60},{-160, 56},{-170, 53}
-};
-
-/* Greenland. */
-static const sun_pt_t k_greenland[] = {
-    { -55, 60},{ -50, 64},{ -42, 65},{ -34, 67},{ -22, 70},{ -20, 75},
-    { -25, 80},{ -45, 82},{ -55, 80},{ -60, 75},{ -55, 70},{ -55, 60}
-};
-
-/* South America. */
-static const sun_pt_t k_s_america[] = {
-    /* North coast */
-    { -77,  8},{ -72, 11},{ -68, 11},{ -62, 10},{ -56,  8},{ -52,  4},
-    { -50,  1},{ -48, -1},
-    /* East coast (Brazil) */
-    { -42, -3},{ -35, -8},{ -38,-13},{ -40,-22},{ -47,-25},{ -52,-31},
-    { -58,-37},{ -63,-41},{ -68,-46},{ -71,-50},{ -68,-54},
-    /* Patagonia south tip */
-    { -65,-55},{ -71,-53},
-    /* West coast */
-    { -73,-50},{ -74,-44},{ -73,-38},{ -71,-30},{ -71,-20},{ -77,-12},
-    { -80, -4},{ -80,  0},{ -78,  4},{ -77,  8}
-};
-
-/* Australia main mass. */
-static const sun_pt_t k_australia[] = {
-    {114, -22},{114, -27},{116, -32},{120, -34},{125, -33},{130, -32},
-    {137, -35},{140, -38},{144, -38},{149, -37},{152, -32},{153, -28},
-    {153, -25},{151, -22},{146, -18},{142, -11},{138, -12},{135, -15},
-    {130, -12},{124, -14},{120, -18},{114, -22}
-};
-
-/* New Zealand pair. */
-static const sun_pt_t k_nz[] = {
-    {172, -34},{174, -38},{176, -41},{172, -42},{169, -45},{167, -47},
-    {171, -46},{173, -41},{175, -39},{173, -36},{172, -34}
-};
-
-/* Antarctica (very rough). */
-static const sun_pt_t k_antarctica[] = {
-    {-180,-72},{-160,-78},{-130,-74},{-100,-72},{ -75,-72},{ -55,-78},
-    { -30,-72},{   0,-70},{  30,-69},{  60,-66},{  90,-66},{ 120,-65},
-    { 150,-72},{ 170,-72},{ 180,-78},
-    { 180,-90},{-180,-90},{-180,-72}
-};
-
-static const sun_poly_t k_continents[] = {
-    { k_eurasia,    sizeof(k_eurasia)   /sizeof(sun_pt_t) },
-    { k_uk,         sizeof(k_uk)        /sizeof(sun_pt_t) },
-    { k_japan,      sizeof(k_japan)     /sizeof(sun_pt_t) },
-    { k_indonesia,  sizeof(k_indonesia) /sizeof(sun_pt_t) },
-    { k_newguinea,  sizeof(k_newguinea) /sizeof(sun_pt_t) },
-    { k_africa,     sizeof(k_africa)    /sizeof(sun_pt_t) },
-    { k_madagascar, sizeof(k_madagascar)/sizeof(sun_pt_t) },
-    { k_n_america,  sizeof(k_n_america) /sizeof(sun_pt_t) },
-    { k_greenland,  sizeof(k_greenland) /sizeof(sun_pt_t) },
-    { k_s_america,  sizeof(k_s_america) /sizeof(sun_pt_t) },
-    { k_australia,  sizeof(k_australia) /sizeof(sun_pt_t) },
-    { k_nz,         sizeof(k_nz)        /sizeof(sun_pt_t) },
-    { k_antarctica, sizeof(k_antarctica)/sizeof(sun_pt_t) },
-};
-
-/* Even-odd polygon fill into the canvas buffer. */
-static void sunmap_fill_poly(lv_color_t *buf, int W, int H,
-                              const sun_pt_t *pts, int n,
-                              lv_color_t color)
-{
-    /* Build per-row x-intersection lists. */
-    for (int y = 0; y < H; y++) {
-        float lat = 90.0f - (y + 0.5f) * (180.0f / H);
-        float xs[64];
-        int   nx = 0;
-        for (int i = 0; i < n - 1; i++) {
-            float la = pts[i].lat,     lo_a = pts[i].lon;
-            float lb = pts[i+1].lat,   lo_b = pts[i+1].lon;
-            if ((la > lat) != (lb > lat)) {
-                float t = (lat - la) / (lb - la);
-                float lon = lo_a + t * (lo_b - lo_a);
-                if (nx < (int)(sizeof(xs)/sizeof(xs[0]))) xs[nx++] = lon;
-            }
-        }
-        /* sort xs */
-        for (int i = 1; i < nx; i++) {
-            float v = xs[i]; int j = i - 1;
-            while (j >= 0 && xs[j] > v) { xs[j+1] = xs[j]; j--; }
-            xs[j+1] = v;
-        }
-        for (int i = 0; i + 1 < nx; i += 2) {
-            int x0 = (int)((xs[i]   + 180.0f) / 360.0f * W);
-            int x1 = (int)((xs[i+1] + 180.0f) / 360.0f * W);
-            if (x0 < 0) x0 = 0;
-            if (x1 > W) x1 = W;
-            for (int x = x0; x < x1; x++) buf[y * W + x] = color;
-        }
-    }
-}
+/* Continents are sourced from main/landmask.h, a 1-bit equirectangular
+   raster (640x172, stretched to fill the canvas) generated offline from
+   Natural Earth 1:110m land polygons. See scripts/gen_landmask.py. */
 
 static void sunmap_redraw(void)
 {
     if (!g_sunmap_buf || !g_sunmap_canvas) return;
     const int W = g_sunmap_w;
     const int H = g_sunmap_h;
-    /* Day side is the "lit" half visually -- water glows lightly,
-       continents glow brighter. Night side is black/muted. */
-    const lv_color_t c_water_n   = lv_color_black();
-    const lv_color_t c_land_n    = lv_color_make(0x40, 0x40, 0x40);
-    const lv_color_t c_land_d    = lv_color_make(0x90, 0x90, 0x90);
-    const lv_color_t c_water_d   = lv_color_make(0x20, 0x20, 0x20);
+    /* Four-tone palette: ocean/land x night/day. The mask is sized for
+       the canvas (LANDMASK_W x LANDMASK_H = 640 x 172) and indexed 1:1. */
+    const lv_color_t c_water_n = lv_color_black();
+    const lv_color_t c_water_d = lv_color_make(0x20, 0x20, 0x20);
+    const lv_color_t c_land_n  = lv_color_make(0x40, 0x40, 0x40);
+    const lv_color_t c_land_d  = lv_color_make(0x90, 0x90, 0x90);
 
-    /* 1. Fill default = night water (black). */
-    for (int i = 0; i < W * H; i++) g_sunmap_buf[i] = c_water_n;
-
-    /* 2. Compute subsolar point in radians. */
+    /* Subsolar point. */
     struct timeval tv;
     gettimeofday(&tv, NULL);
     time_t now = tv.tv_sec;
@@ -1383,39 +1163,25 @@ static void sunmap_redraw(void)
     float utc_hours = tm.tm_hour + tm.tm_min / 60.0f + tm.tm_sec / 3600.0f;
     float sun_lon_deg = -15.0f * (utc_hours - 12.0f);
     float sun_lat_deg = 23.44f * sinf(2.0f * (float)M_PI * (doy - 81) / 365.0f);
-    float sl = sun_lat_deg * (float)M_PI / 180.0f;
-    float so = sun_lon_deg * (float)M_PI / 180.0f;
+    float sl     = sun_lat_deg * (float)M_PI / 180.0f;
+    float so     = sun_lon_deg * (float)M_PI / 180.0f;
+    float sin_sl = sinf(sl);
+    float cos_sl = cosf(sl);
 
-    /* 3. Brighten day-side water -- sun above horizon = lighter. */
     for (int y = 0; y < H; y++) {
         float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
-        float sin_lat_p = sinf(lat);
-        float cos_lat_p = cosf(lat);
+        float sin_p = sinf(lat);
+        float cos_p = cosf(lat);
+        const float lon0 = -(float)M_PI;
+        const float dlon = 2.0f * (float)M_PI / W;
         for (int x = 0; x < W; x++) {
-            float lon = (-180.0f + (x + 0.5f) * (360.0f / W)) * (float)M_PI / 180.0f;
-            float c = sinf(sl) * sin_lat_p + cosf(sl) * cos_lat_p * cosf(lon - so);
-            if (c > 0) g_sunmap_buf[y * W + x] = c_water_d;
-        }
-    }
-
-    /* 4. Draw continents: default to night colour (darker grey),
-       then re-shade day-side land cells to the day colour (lighter). */
-    for (size_t i = 0; i < sizeof(k_continents)/sizeof(k_continents[0]); i++) {
-        sunmap_fill_poly(g_sunmap_buf, W, H,
-                         k_continents[i].pts, k_continents[i].n, c_land_n);
-    }
-    /* Brighten day-side land pixels. */
-    for (int y = 0; y < H; y++) {
-        float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
-        float sin_lat_p = sinf(lat);
-        float cos_lat_p = cosf(lat);
-        for (int x = 0; x < W; x++) {
-            lv_color_t *p = &g_sunmap_buf[y * W + x];
-            if (p->full == c_land_n.full) {
-                float lon = (-180.0f + (x + 0.5f) * (360.0f / W)) * (float)M_PI / 180.0f;
-                float c = sinf(sl) * sin_lat_p + cosf(sl) * cos_lat_p * cosf(lon - so);
-                if (c > 0) *p = c_land_d;
-            }
+            float lon = lon0 + (x + 0.5f) * dlon;
+            float c = sin_sl * sin_p + cos_sl * cos_p * cosf(lon - so);
+            int land = landmask_get(x, y);
+            lv_color_t color;
+            if (c > 0) color = land ? c_land_d : c_water_d;
+            else       color = land ? c_land_n : c_water_n;
+            g_sunmap_buf[y * W + x] = color;
         }
     }
 
