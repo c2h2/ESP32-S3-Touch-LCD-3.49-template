@@ -1363,14 +1363,14 @@ static void sunmap_redraw(void)
     if (!g_sunmap_buf || !g_sunmap_canvas) return;
     const int W = g_sunmap_w;
     const int H = g_sunmap_h;
-    /* Night side is the "lit" half visually -- water glows lightly,
-       continents glow brighter. Day side is the muted half. */
-    const lv_color_t c_water_n   = lv_color_make(0x20, 0x20, 0x20);
-    const lv_color_t c_land_n    = lv_color_make(0x90, 0x90, 0x90);
-    const lv_color_t c_land_d    = lv_color_make(0x40, 0x40, 0x40);
-    const lv_color_t c_water_d   = lv_color_black();
+    /* Day side is the "lit" half visually -- water glows lightly,
+       continents glow brighter. Night side is black/muted. */
+    const lv_color_t c_water_n   = lv_color_black();
+    const lv_color_t c_land_n    = lv_color_make(0x40, 0x40, 0x40);
+    const lv_color_t c_land_d    = lv_color_make(0x90, 0x90, 0x90);
+    const lv_color_t c_water_d   = lv_color_make(0x20, 0x20, 0x20);
 
-    /* 1. Fill default = night water (lit-up dark grey). */
+    /* 1. Fill default = night water (black). */
     for (int i = 0; i < W * H; i++) g_sunmap_buf[i] = c_water_n;
 
     /* 2. Compute subsolar point in radians. */
@@ -1386,7 +1386,7 @@ static void sunmap_redraw(void)
     float sl = sun_lat_deg * (float)M_PI / 180.0f;
     float so = sun_lon_deg * (float)M_PI / 180.0f;
 
-    /* 3. Mute day-side water -- sun above horizon = darker. */
+    /* 3. Brighten day-side water -- sun above horizon = lighter. */
     for (int y = 0; y < H; y++) {
         float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
         float sin_lat_p = sinf(lat);
@@ -1398,13 +1398,13 @@ static void sunmap_redraw(void)
         }
     }
 
-    /* 4. Draw continents: default to night colour (lighter grey),
-       then re-shade day-side land cells to the day colour (darker). */
+    /* 4. Draw continents: default to night colour (darker grey),
+       then re-shade day-side land cells to the day colour (lighter). */
     for (size_t i = 0; i < sizeof(k_continents)/sizeof(k_continents[0]); i++) {
         sunmap_fill_poly(g_sunmap_buf, W, H,
                          k_continents[i].pts, k_continents[i].n, c_land_n);
     }
-    /* Mute day-side land pixels. */
+    /* Brighten day-side land pixels. */
     for (int y = 0; y < H; y++) {
         float lat = (90.0f - (y + 0.5f) * (180.0f / H)) * (float)M_PI / 180.0f;
         float sin_lat_p = sinf(lat);
@@ -2062,28 +2062,17 @@ extern "C" void app_main(void)
     setenv("TZ", "UTC0", 1);
     tzset();
     {
-        /* Parse __DATE__ ("Mmm dd yyyy") and __TIME__ ("hh:mm:ss"). */
-        const char *bdate = __DATE__;
-        const char *btime = __TIME__;
-        static const char k_months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-        int b_y = 0, b_d = 0, b_h = 0, b_mi = 0, b_s = 0;
-        char mon3[4] = { bdate[0], bdate[1], bdate[2], 0 };
-        const char *p = strstr(k_months, mon3);
-        int b_mo = p ? ((int)(p - k_months) / 3 + 1) : 1;
-        b_d = atoi(bdate + 4);          /* day, possibly leading space */
-        b_y = atoi(bdate + 7);          /* 4-digit year */
-        b_h  = (btime[0]-'0')*10 + (btime[1]-'0');
-        b_mi = (btime[3]-'0')*10 + (btime[4]-'0');
-        b_s  = (btime[6]-'0')*10 + (btime[7]-'0');
-
+        /* BUILD_EPOCH_UTC is injected by CMake (string(TIMESTAMP ... UTC)) so
+           the seed is real UTC regardless of the build machine's timezone. */
+        time_t build_epoch = (time_t)BUILD_EPOCH_UTC;
         struct tm bt = {};
-        bt.tm_year = b_y - 1900;
-        bt.tm_mon  = b_mo - 1;
-        bt.tm_mday = b_d;
-        bt.tm_hour = b_h;
-        bt.tm_min  = b_mi;
-        bt.tm_sec  = b_s;
-        time_t build_epoch = mktime(&bt);
+        gmtime_r(&build_epoch, &bt);
+        int b_y  = bt.tm_year + 1900;
+        int b_mo = bt.tm_mon + 1;
+        int b_d  = bt.tm_mday;
+        int b_h  = bt.tm_hour;
+        int b_mi = bt.tm_min;
+        int b_s  = bt.tm_sec;
 
         RtcDateTime_t r = i2c_rtc_get();
         struct tm rt = {};

@@ -6,3 +6,6 @@ idf_component_register(SRCS "main.cpp" "font_jbmono_48.c" "font_jbmono_64.c" "fo
                              nvs_flash esp_wifi esp_event esp_netif
                              espressif__esp_lcd_axs15231b
                              espressif__esp_io_expander_tca9554)
+
+string(TIMESTAMP BUILD_EPOCH_UTC "%s" UTC)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE BUILD_EPOCH_UTC=${BUILD_EPOCH_UTC})
