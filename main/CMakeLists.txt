@@ -3,5 +3,6 @@ idf_component_register(SRCS "main.cpp" "font_jbmono_48.c" "font_jbmono_64.c" "fo
                     REQUIRES audio_min esp_timer esp_lcd driver
                              i2c_bsp i2c_equipment lcd_bl_pwm_bsp adc_bsp
                              sdcard_bsp button_bsp lvgl
+                             nvs_flash esp_wifi esp_event esp_netif
                              espressif__esp_lcd_axs15231b
                              espressif__esp_io_expander_tca9554)

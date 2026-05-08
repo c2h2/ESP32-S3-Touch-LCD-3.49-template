@@ -4,6 +4,12 @@
 #include <time.h>
 #include <sys/time.h>
 
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -60,6 +66,58 @@ static int               canvas_h        = UI_CANVAS_H;  /* 172 */
 static lv_disp_drv_t    *g_disp_drv      = NULL;
 static char              g_status_text[256];
 
+/* ---------------------- Settings (NVS-backed) ---------------------- */
+
+typedef struct {
+    int8_t   tz_h;          /* hours offset from UTC, -12..14 */
+    uint8_t  brightness;    /* 0..255, applied to setUpduty (after invert) */
+    uint16_t dim_s;         /* idle seconds before dim */
+    uint16_t off_s;         /* idle seconds before backlight off */
+    char     last_ssid[33]; /* last connected SSID */
+} app_cfg_t;
+
+static app_cfg_t g_cfg = {
+    .tz_h       = TZ_OFFSET_HOURS,
+    .brightness = 255,
+    .dim_s      = 30,
+    .off_s      = 120,
+    .last_ssid  = {0}
+};
+
+static void cfg_load(void);
+static void cfg_save(void);
+static void cfg_save_ssid_pass(const char *ssid, const char *pass);
+static bool cfg_get_ssid_pass(const char *ssid, char *pass, size_t pass_len);
+
+/* ---------------------- Wi-Fi ---------------------- */
+
+#define WIFI_MAX_SCAN_AP 16
+typedef struct {
+    char    ssid[33];
+    int8_t  rssi;
+    uint8_t auth;  /* 0 = open */
+} wifi_scan_ap_t;
+
+static wifi_scan_ap_t g_wifi_scan[WIFI_MAX_SCAN_AP];
+static uint16_t       g_wifi_scan_n = 0;
+static bool           g_wifi_inited = false;
+static bool           g_wifi_connected = false;
+static char           g_wifi_curr_ssid[33] = {0};
+
+static void wifi_init_once(void);
+static void wifi_start_scan(void);
+static void wifi_connect(const char *ssid, const char *pass);
+
+/* ---------------------- Backlight + auto-dim ---------------------- */
+
+static uint32_t g_last_activity_ms = 0;
+static int      g_dim_state        = 0;  /* 0=full, 1=dim, 2=off */
+static lv_timer_t *g_dim_timer     = NULL;
+
+static void backlight_apply(uint8_t bri /*0..255, 255=full*/);
+static void activity_kick(lv_event_t *e);
+static void dim_timer_cb(lv_timer_t *t);
+
 /* Tileview-based UI: hello | clock (start) | sunmap. Swipe horizontally. */
 static lv_obj_t  *g_tileview         = NULL;
 static lv_obj_t  *g_clock_time_label = NULL;
@@ -72,6 +130,13 @@ static int        g_sunmap_h         = 0;
 static lv_timer_t *g_clock_timer     = NULL;
 static lv_timer_t *g_clock_ms_timer  = NULL;
 static lv_timer_t *g_sunmap_timer    = NULL;
+
+/* Settings tile widgets (rebuilt on rotate). */
+static lv_obj_t  *g_set_wifi_status = NULL;
+static lv_obj_t  *g_set_wifi_list   = NULL;
+static lv_obj_t  *g_set_kb_overlay  = NULL;
+static lv_obj_t  *g_set_kb_ta       = NULL;
+static char       g_set_kb_ssid[33] = {0};
 
 static void show_main_ui(const char *status_text);
 
@@ -515,11 +580,212 @@ static void rotate_btn_event_cb(lv_event_t *e)
     g_clock_ms_label = NULL;
     g_clock_date_label = NULL;
     g_sunmap_canvas = NULL;
+    g_set_wifi_status = NULL;
+    g_set_wifi_list   = NULL;
+    g_set_kb_overlay  = NULL;
+    g_set_kb_ta       = NULL;
     if (g_clock_timer)    { lv_timer_del(g_clock_timer);    g_clock_timer    = NULL; }
     if (g_clock_ms_timer) { lv_timer_del(g_clock_ms_timer); g_clock_ms_timer = NULL; }
     if (g_sunmap_timer)   { lv_timer_del(g_sunmap_timer);   g_sunmap_timer   = NULL; }
+    if (g_dim_timer)      { lv_timer_del(g_dim_timer);      g_dim_timer      = NULL; }
     show_main_ui(g_status_text);
     ESP_LOGI(TAG, "rotate -> %d deg  canvas=%dx%d", rot_state * 90, canvas_w, canvas_h);
+}
+
+/* ---------------------- Settings: NVS impl ---------------------- */
+
+#define NVS_NS_CFG  "cfg"
+#define NVS_NS_WIFI "wifi"
+
+static void cfg_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_CFG, NVS_READONLY, &h) != ESP_OK) return;
+    int8_t   tz = g_cfg.tz_h;
+    uint8_t  br = g_cfg.brightness;
+    uint16_t ds = g_cfg.dim_s;
+    uint16_t os = g_cfg.off_s;
+    size_t   sl = sizeof(g_cfg.last_ssid);
+    nvs_get_i8 (h, "tz_h",      &tz);
+    nvs_get_u8 (h, "bri",       &br);
+    nvs_get_u16(h, "dim_s",     &ds);
+    nvs_get_u16(h, "off_s",     &os);
+    nvs_get_str(h, "last_ssid", g_cfg.last_ssid, &sl);
+    nvs_close(h);
+    g_cfg.tz_h       = tz;
+    g_cfg.brightness = br;
+    g_cfg.dim_s      = ds;
+    g_cfg.off_s      = os;
+}
+
+static void cfg_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_CFG, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i8 (h, "tz_h",      g_cfg.tz_h);
+    nvs_set_u8 (h, "bri",       g_cfg.brightness);
+    nvs_set_u16(h, "dim_s",     g_cfg.dim_s);
+    nvs_set_u16(h, "off_s",     g_cfg.off_s);
+    nvs_set_str(h, "last_ssid", g_cfg.last_ssid);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void cfg_save_ssid_pass(const char *ssid, const char *pass)
+{
+    if (!ssid || !*ssid) return;
+    /* Use first 15 chars of SSID as the key (NVS key max 15 bytes). */
+    char key[16] = {0};
+    strncpy(key, ssid, 15);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_WIFI, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, key, pass ? pass : "");
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static bool cfg_get_ssid_pass(const char *ssid, char *pass, size_t pass_len)
+{
+    if (!ssid || !*ssid || !pass) return false;
+    char key[16] = {0};
+    strncpy(key, ssid, 15);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_WIFI, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t l = pass_len;
+    esp_err_t er = nvs_get_str(h, key, pass, &l);
+    nvs_close(h);
+    return er == ESP_OK;
+}
+
+/* ---------------------- Wi-Fi impl ---------------------- */
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                                int32_t id, void *data)
+{
+    (void)arg; (void)data;
+    if (base == WIFI_EVENT) {
+        switch (id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "wifi: STA_START");
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                ESP_LOGW(TAG, "wifi: disconnected");
+                g_wifi_connected = false;
+                break;
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(TAG, "wifi: connected to %s", g_wifi_curr_ssid);
+                g_wifi_connected = true;
+                /* Persist this SSID as the auto-connect target. */
+                strncpy(g_cfg.last_ssid, g_wifi_curr_ssid, sizeof(g_cfg.last_ssid) - 1);
+                cfg_save();
+                break;
+            case WIFI_EVENT_SCAN_DONE: {
+                uint16_t apc = WIFI_MAX_SCAN_AP;
+                wifi_ap_record_t recs[WIFI_MAX_SCAN_AP];
+                if (esp_wifi_scan_get_ap_records(&apc, recs) == ESP_OK) {
+                    g_wifi_scan_n = apc;
+                    for (int i = 0; i < apc; i++) {
+                        strncpy(g_wifi_scan[i].ssid, (const char *)recs[i].ssid,
+                                sizeof(g_wifi_scan[i].ssid) - 1);
+                        g_wifi_scan[i].ssid[sizeof(g_wifi_scan[i].ssid) - 1] = 0;
+                        g_wifi_scan[i].rssi = recs[i].rssi;
+                        g_wifi_scan[i].auth = (uint8_t)recs[i].authmode;
+                    }
+                } else {
+                    g_wifi_scan_n = 0;
+                }
+                ESP_LOGI(TAG, "wifi: scan done, n=%u", (unsigned)g_wifi_scan_n);
+                break;
+            }
+            default: break;
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "wifi: got IP");
+    }
+}
+
+static void wifi_init_once(void)
+{
+    if (g_wifi_inited) return;
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+    g_wifi_inited = true;
+}
+
+static void wifi_start_scan(void)
+{
+    wifi_init_once();
+    wifi_scan_config_t sc = {};
+    sc.show_hidden = false;
+    sc.scan_type   = WIFI_SCAN_TYPE_ACTIVE;
+    esp_err_t er = esp_wifi_scan_start(&sc, false);
+    if (er != ESP_OK) ESP_LOGW(TAG, "wifi: scan_start=%s", esp_err_to_name(er));
+}
+
+static void wifi_connect(const char *ssid, const char *pass)
+{
+    wifi_init_once();
+    wifi_config_t wc = {};
+    strncpy((char *)wc.sta.ssid,     ssid, sizeof(wc.sta.ssid) - 1);
+    strncpy((char *)wc.sta.password, pass ? pass : "", sizeof(wc.sta.password) - 1);
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    strncpy(g_wifi_curr_ssid, ssid, sizeof(g_wifi_curr_ssid) - 1);
+    g_wifi_curr_ssid[sizeof(g_wifi_curr_ssid) - 1] = 0;
+    esp_wifi_disconnect();
+    esp_err_t er = esp_wifi_connect();
+    ESP_LOGI(TAG, "wifi: connect %s pass_len=%u -> %s",
+             ssid, (unsigned)(pass ? strlen(pass) : 0), esp_err_to_name(er));
+}
+
+/* ---------------------- Backlight + auto-dim impl ---------------------- */
+
+static void backlight_apply(uint8_t bri)
+{
+    /* setUpduty takes the inverted PWM value: 0xFF = off, 0x00 = full.
+       g_cfg.brightness uses 0..255 with 255 = full, so invert. */
+    setUpduty((uint16_t)(0xFF - bri));
+}
+
+static void activity_kick(lv_event_t *e)
+{
+    (void)e;
+    g_last_activity_ms = lv_tick_get();
+    if (g_dim_state != 0) {
+        g_dim_state = 0;
+        backlight_apply(g_cfg.brightness);
+    }
+}
+
+static void dim_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    uint32_t idle_ms = lv_tick_elaps(g_last_activity_ms);
+    int want = 0;
+    if (g_cfg.off_s > 0 && idle_ms >= (uint32_t)g_cfg.off_s * 1000) {
+        want = 2;
+    } else if (g_cfg.dim_s > 0 && idle_ms >= (uint32_t)g_cfg.dim_s * 1000) {
+        want = 1;
+    }
+    if (want != g_dim_state) {
+        g_dim_state = want;
+        if (want == 0) backlight_apply(g_cfg.brightness);
+        else if (want == 1) backlight_apply(g_cfg.brightness / 8 + 4);
+        else backlight_apply(0);
+    }
 }
 
 /* ---------------------- Clock tile ---------------------- */
@@ -1007,6 +1273,298 @@ static void build_hello_tile(lv_obj_t *parent, const char *status_text)
 
 }
 
+/* ---------------------- Settings tile ---------------------- */
+
+static void set_render_wifi_list(void);
+
+/* Keyboard overlay for password entry. */
+static void kb_close(void)
+{
+    if (g_set_kb_overlay) {
+        lv_obj_del(g_set_kb_overlay);
+        g_set_kb_overlay = NULL;
+        g_set_kb_ta      = NULL;
+    }
+}
+
+static void kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (code == LV_EVENT_READY) {
+        const char *pass = lv_textarea_get_text(g_set_kb_ta);
+        char ssid[33] = {0};
+        strncpy(ssid, g_set_kb_ssid, sizeof(ssid) - 1);
+        ESP_LOGI(TAG, "kb: connect ssid=%s pass_len=%u", ssid, (unsigned)strlen(pass));
+        cfg_save_ssid_pass(ssid, pass);
+        wifi_connect(ssid, pass);
+        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ssid);
+        kb_close();
+    } else if (code == LV_EVENT_CANCEL) {
+        kb_close();
+    } else {
+        (void)kb;
+    }
+}
+
+static void kb_open_for_ssid(const char *ssid)
+{
+    strncpy(g_set_kb_ssid, ssid, sizeof(g_set_kb_ssid) - 1);
+    g_set_kb_ssid[sizeof(g_set_kb_ssid) - 1] = 0;
+
+    lv_obj_t *scr = lv_scr_act();
+    g_set_kb_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(g_set_kb_overlay);
+    lv_obj_set_size(g_set_kb_overlay, canvas_w, canvas_h);
+    lv_obj_set_style_bg_color(g_set_kb_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_set_kb_overlay, LV_OPA_90, 0);
+    lv_obj_clear_flag(g_set_kb_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(g_set_kb_overlay);
+    lv_label_set_text_fmt(title, "Password for %s", ssid);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 4, 2);
+
+    g_set_kb_ta = lv_textarea_create(g_set_kb_overlay);
+    lv_textarea_set_one_line(g_set_kb_ta, true);
+    lv_textarea_set_password_mode(g_set_kb_ta, true);
+    lv_textarea_set_placeholder_text(g_set_kb_ta, "Wi-Fi password");
+    lv_obj_set_width(g_set_kb_ta, canvas_w - 8);
+    lv_obj_align(g_set_kb_ta, LV_ALIGN_TOP_LEFT, 4, 18);
+    lv_obj_set_style_text_font(g_set_kb_ta, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *kb = lv_keyboard_create(g_set_kb_overlay);
+    lv_obj_set_width(kb, canvas_w);
+    lv_obj_set_height(kb, canvas_h - 48);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(kb, g_set_kb_ta);
+    lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_READY,  NULL);
+    lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_CANCEL, NULL);
+}
+
+static void wifi_ap_clicked_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (int)g_wifi_scan_n) return;
+    const wifi_scan_ap_t *ap = &g_wifi_scan[idx];
+    /* If we have a saved password for this SSID, just connect. Else
+       open the keyboard overlay for password entry. Open networks
+       (auth=0) connect with empty password. */
+    if (ap->auth == 0) {
+        cfg_save_ssid_pass(ap->ssid, "");
+        wifi_connect(ap->ssid, "");
+        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ap->ssid);
+        return;
+    }
+    char pass[65] = {0};
+    if (cfg_get_ssid_pass(ap->ssid, pass, sizeof(pass))) {
+        wifi_connect(ap->ssid, pass);
+        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ap->ssid);
+        return;
+    }
+    kb_open_for_ssid(ap->ssid);
+}
+
+static void set_render_wifi_list(void)
+{
+    if (!g_set_wifi_list) return;
+    lv_obj_clean(g_set_wifi_list);
+    if (g_wifi_scan_n == 0) {
+        lv_obj_t *empty = lv_label_create(g_set_wifi_list);
+        lv_label_set_text(empty, "(no networks yet -- tap Scan)");
+        lv_obj_set_style_text_color(empty, lv_color_make(0xa0, 0xa0, 0xa0), 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        return;
+    }
+    for (int i = 0; i < g_wifi_scan_n; i++) {
+        const wifi_scan_ap_t *ap = &g_wifi_scan[i];
+        lv_obj_t *btn = lv_btn_create(g_set_wifi_list);
+        lv_obj_set_width(btn, lv_pct(100));
+        lv_obj_set_height(btn, 22);
+        lv_obj_set_style_bg_color(btn, lv_color_make(0x20, 0x20, 0x30), 0);
+        lv_obj_set_style_pad_all(btn, 2, 0);
+        lv_obj_add_event_cb(btn, wifi_ap_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *l = lv_label_create(btn);
+        lv_label_set_text_fmt(l, "%s%s  (%d dBm)",
+                              ap->auth == 0 ? "" : LV_SYMBOL_KEYBOARD " ",
+                              ap->ssid[0] ? ap->ssid : "(hidden)",
+                              ap->rssi);
+        lv_obj_set_style_text_color(l, lv_color_white(), 0);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
+    }
+}
+
+static void scan_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_set_wifi_status) lv_label_set_text(g_set_wifi_status, "Scanning...");
+    wifi_start_scan();
+    /* Schedule a one-shot UI refresh ~3s later when scan_done has fired. */
+    lv_timer_t *t = lv_timer_create([](lv_timer_t *tt) {
+        if (g_set_wifi_status) {
+            lv_label_set_text_fmt(g_set_wifi_status, "Found %u networks", (unsigned)g_wifi_scan_n);
+        }
+        set_render_wifi_list();
+        lv_timer_del(tt);
+    }, 3000, NULL);
+    (void)t;
+}
+
+static void tz_dec_cb(lv_event_t *e) { (void)e; if (g_cfg.tz_h > -12) { g_cfg.tz_h--; cfg_save();
+    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
+    if (lbl) lv_label_set_text_fmt(lbl, "UTC%+d", g_cfg.tz_h); } }
+static void tz_inc_cb(lv_event_t *e) { (void)e; if (g_cfg.tz_h <  14) { g_cfg.tz_h++; cfg_save();
+    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
+    if (lbl) lv_label_set_text_fmt(lbl, "UTC%+d", g_cfg.tz_h); } }
+
+static void bri_slider_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    int v = lv_slider_get_value(s);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    g_cfg.brightness = (uint8_t)v;
+    if (g_dim_state == 0) backlight_apply(g_cfg.brightness);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
+}
+
+static void dim_s_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    int v = lv_slider_get_value(s);
+    g_cfg.dim_s = (uint16_t)v;
+    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
+    if (lbl) lv_label_set_text_fmt(lbl, "Dim after %us", g_cfg.dim_s);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
+}
+
+static void off_s_cb(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    int v = lv_slider_get_value(s);
+    g_cfg.off_s = (uint16_t)v;
+    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
+    if (lbl) lv_label_set_text_fmt(lbl, "Off after %us", g_cfg.off_s);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
+}
+
+static void build_settings_tile(lv_obj_t *parent)
+{
+    lv_obj_set_style_bg_color(parent, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(parent, 4, 0);
+
+    /* Vertically scrollable column. */
+    lv_obj_t *col = lv_obj_create(parent);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, lv_pct(100), lv_pct(100));
+    lv_obj_set_layout(col, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 4, 0);
+    lv_obj_set_scroll_dir(col, LV_DIR_VER);
+
+    /* --- Wi-Fi --- */
+    lv_obj_t *h_wifi = lv_label_create(col);
+    lv_label_set_text(h_wifi, "Wi-Fi");
+    lv_obj_set_style_text_color(h_wifi, lv_color_make(0x80, 0xc0, 0xff), 0);
+    lv_obj_set_style_text_font(h_wifi, &lv_font_montserrat_16, 0);
+
+    g_set_wifi_status = lv_label_create(col);
+    lv_label_set_text_fmt(g_set_wifi_status, "%s",
+                          g_wifi_connected ? g_wifi_curr_ssid : "Not connected");
+    lv_obj_set_style_text_color(g_set_wifi_status, lv_color_make(0xc0, 0xc0, 0xc0), 0);
+    lv_obj_set_style_text_font(g_set_wifi_status, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *scan_btn = lv_btn_create(col);
+    lv_obj_set_height(scan_btn, 26);
+    lv_obj_set_width(scan_btn, 110);
+    lv_obj_t *scan_l = lv_label_create(scan_btn);
+    lv_label_set_text(scan_l, "Scan networks");
+    lv_obj_set_style_text_font(scan_l, &lv_font_montserrat_12, 0);
+    lv_obj_center(scan_l);
+    lv_obj_add_event_cb(scan_btn, scan_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    g_set_wifi_list = lv_obj_create(col);
+    lv_obj_set_width(g_set_wifi_list, lv_pct(100));
+    lv_obj_set_height(g_set_wifi_list, 100);
+    lv_obj_set_layout(g_set_wifi_list, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(g_set_wifi_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_set_wifi_list, 2, 0);
+    lv_obj_set_style_bg_color(g_set_wifi_list, lv_color_make(0x10, 0x10, 0x14), 0);
+    lv_obj_set_scroll_dir(g_set_wifi_list, LV_DIR_VER);
+    set_render_wifi_list();
+
+    /* --- Time --- */
+    lv_obj_t *h_time = lv_label_create(col);
+    lv_label_set_text(h_time, "Time");
+    lv_obj_set_style_text_color(h_time, lv_color_make(0x80, 0xc0, 0xff), 0);
+    lv_obj_set_style_text_font(h_time, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *tz_row = lv_obj_create(col);
+    lv_obj_remove_style_all(tz_row);
+    lv_obj_set_width(tz_row, lv_pct(100));
+    lv_obj_set_height(tz_row, 30);
+    lv_obj_t *tz_lbl = lv_label_create(tz_row);
+    lv_label_set_text_fmt(tz_lbl, "UTC%+d", g_cfg.tz_h);
+    lv_obj_set_style_text_color(tz_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(tz_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(tz_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t *tz_minus = lv_btn_create(tz_row);
+    lv_obj_set_size(tz_minus, 30, 26);
+    lv_obj_align(tz_minus, LV_ALIGN_LEFT_MID, 80, 0);
+    lv_obj_t *tm_l = lv_label_create(tz_minus);
+    lv_label_set_text(tm_l, "-"); lv_obj_center(tm_l);
+    lv_obj_add_event_cb(tz_minus, tz_dec_cb, LV_EVENT_CLICKED, tz_lbl);
+    lv_obj_t *tz_plus = lv_btn_create(tz_row);
+    lv_obj_set_size(tz_plus, 30, 26);
+    lv_obj_align(tz_plus, LV_ALIGN_LEFT_MID, 116, 0);
+    lv_obj_t *tp_l = lv_label_create(tz_plus);
+    lv_label_set_text(tp_l, "+"); lv_obj_center(tp_l);
+    lv_obj_add_event_cb(tz_plus, tz_inc_cb, LV_EVENT_CLICKED, tz_lbl);
+
+    /* --- Display --- */
+    lv_obj_t *h_disp = lv_label_create(col);
+    lv_label_set_text(h_disp, "Display");
+    lv_obj_set_style_text_color(h_disp, lv_color_make(0x80, 0xc0, 0xff), 0);
+    lv_obj_set_style_text_font(h_disp, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *bri_row = lv_label_create(col);
+    lv_label_set_text(bri_row, "Brightness");
+    lv_obj_set_style_text_color(bri_row, lv_color_white(), 0);
+    lv_obj_set_style_text_font(bri_row, &lv_font_montserrat_12, 0);
+    lv_obj_t *bri_s = lv_slider_create(col);
+    lv_obj_set_width(bri_s, lv_pct(95));
+    lv_slider_set_range(bri_s, 8, 255);
+    lv_slider_set_value(bri_s, g_cfg.brightness, LV_ANIM_OFF);
+    lv_obj_add_event_cb(bri_s, bri_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(bri_s, bri_slider_cb, LV_EVENT_RELEASED,      NULL);
+
+    lv_obj_t *dim_lbl = lv_label_create(col);
+    lv_label_set_text_fmt(dim_lbl, "Dim after %us", g_cfg.dim_s);
+    lv_obj_set_style_text_color(dim_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(dim_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_t *dim_s = lv_slider_create(col);
+    lv_obj_set_width(dim_s, lv_pct(95));
+    lv_slider_set_range(dim_s, 5, 600);
+    lv_slider_set_value(dim_s, g_cfg.dim_s, LV_ANIM_OFF);
+    lv_obj_add_event_cb(dim_s, dim_s_cb, LV_EVENT_VALUE_CHANGED, dim_lbl);
+    lv_obj_add_event_cb(dim_s, dim_s_cb, LV_EVENT_RELEASED,      dim_lbl);
+
+    lv_obj_t *off_lbl = lv_label_create(col);
+    lv_label_set_text_fmt(off_lbl, "Off after %us", g_cfg.off_s);
+    lv_obj_set_style_text_color(off_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(off_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_t *off_s = lv_slider_create(col);
+    lv_obj_set_width(off_s, lv_pct(95));
+    lv_slider_set_range(off_s, 10, 1800);
+    lv_slider_set_value(off_s, g_cfg.off_s, LV_ANIM_OFF);
+    lv_obj_add_event_cb(off_s, off_s_cb, LV_EVENT_VALUE_CHANGED, off_lbl);
+    lv_obj_add_event_cb(off_s, off_s_cb, LV_EVENT_RELEASED,      off_lbl);
+}
+
 /* ---------------------- Top-level UI builder ---------------------- */
 
 static void build_main_ui(const char *status_text)
@@ -1024,11 +1582,14 @@ static void build_main_ui(const char *status_text)
     lv_obj_set_scrollbar_mode(g_tileview, LV_SCROLLBAR_MODE_OFF);
 
     /* Tile 0: clock with the world daylight map as its background.
-       Tile 1: legacy hello-world demo screen (last). */
+       Tile 1: settings (Wi-Fi, time, display).
+       Tile 2: legacy hello-world demo screen. */
     lv_obj_t *t_clock = lv_tileview_add_tile(g_tileview, 0, 0, LV_DIR_RIGHT);
-    lv_obj_t *t_hello = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT);
+    lv_obj_t *t_set   = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    lv_obj_t *t_hello = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT);
 
     build_clock_tile(t_clock);
+    build_settings_tile(t_set);
     build_hello_tile(t_hello, status_text);
 
     /* FPS overlay: parented to the screen (not the tileview) so it
@@ -1046,6 +1607,14 @@ static void build_main_ui(const char *status_text)
     if (!fps_timer_created) {
         lv_timer_create(fps_timer_cb, 3000, NULL);
         fps_timer_created = true;
+    }
+
+    /* Activity wake: any touch on the screen kicks the dim timer. */
+    lv_obj_add_event_cb(scr, activity_kick, LV_EVENT_PRESSED,  NULL);
+    lv_obj_add_event_cb(scr, activity_kick, LV_EVENT_RELEASED, NULL);
+    g_last_activity_ms = lv_tick_get();
+    if (!g_dim_timer) {
+        g_dim_timer = lv_timer_create(dim_timer_cb, 1000, NULL);
     }
 
     /* Start on the clock. */
@@ -1071,6 +1640,22 @@ extern "C" void app_main(void)
     esp_log_level_set(TAG, ESP_LOG_DEBUG);
     esp_log_level_set("lcd_panel.axs15231b", ESP_LOG_VERBOSE);
     esp_log_level_set("lcd_panel.io.spi", ESP_LOG_VERBOSE);
+
+    /* Persisted user settings: load early so brightness/timezone are
+       applied before the UI builds. NVS init must happen before
+       Wi-Fi (esp_wifi requires it) and before any cfg_load(). */
+    {
+        esp_err_t er = nvs_flash_init();
+        if (er == ESP_ERR_NVS_NO_FREE_PAGES || er == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            er = nvs_flash_init();
+        }
+        ESP_ERROR_CHECK(er);
+    }
+    cfg_load();
+    ESP_LOGI(TAG, "cfg: tz=%+d bri=%u dim=%us off=%us last_ssid=%s",
+             g_cfg.tz_h, g_cfg.brightness, g_cfg.dim_s, g_cfg.off_s,
+             g_cfg.last_ssid[0] ? g_cfg.last_ssid : "(none)");
     ESP_LOGI(TAG, "===== 12_HelloWorld_Skeleton boot =====");
     ESP_LOGI(TAG, "H_RES=%d V_RES=%d  DMA=%d SPIRAM=%d",
              EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES,
@@ -1100,8 +1685,8 @@ extern "C" void app_main(void)
     }
     pos += snprintf(status + pos, sizeof(status) - pos, "TCA9554 OK\n");
 
-    ESP_LOGI(TAG, "[3/9] LCD backlight PWM (full)");
-    lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
+    ESP_LOGI(TAG, "[3/9] LCD backlight PWM (from cfg)");
+    lcd_bl_pwm_bsp_init((uint16_t)(0xFF - g_cfg.brightness));
     pos += snprintf(status + pos, sizeof(status) - pos, "BL OK\n");
 
     ESP_LOGI(TAG, "[4/9] LCD panel init");
@@ -1201,6 +1786,18 @@ extern "C" void app_main(void)
 
     show_main_ui(status);
     ESP_LOGI(TAG, "===== All drivers initialized =====");
+
+    /* If we have a saved last-SSID and a stored password for it, try
+       to auto-connect at boot. Wi-Fi is initialised lazily inside
+       wifi_connect / wifi_start_scan to keep idle power down for
+       users who never visit the settings tile. */
+    if (g_cfg.last_ssid[0]) {
+        char pass[65] = {0};
+        if (cfg_get_ssid_pass(g_cfg.last_ssid, pass, sizeof(pass))) {
+            ESP_LOGI(TAG, "auto-connect: %s", g_cfg.last_ssid);
+            wifi_connect(g_cfg.last_ssid, pass);
+        }
+    }
 
     uint32_t heartbeat = 0;
     for (;;) {
