@@ -87,15 +87,24 @@ static void lvgl_tick_inc_cb(void *arg)
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
-    const int flush_count = (EXAMPLE_LCD_V_RES + LVGL_FLUSH_STRIP_ROWS - 1) / LVGL_FLUSH_STRIP_ROWS;
-    const int offgap      = LVGL_FLUSH_STRIP_ROWS;
     const int PW          = EXAMPLE_LCD_H_RES;     /* panel width  = 172 */
     const int PH          = EXAMPLE_LCD_V_RES;     /* panel height = 640 */
     const int CW          = canvas_w;
     const int CH          = canvas_h;
     const int rs          = rot_state;
 
+    /* direct_mode: color_map points at the full canvas framebuffer
+       (LVGL has only redrawn the dirty area, but the rest is already
+       valid from the last frame). The AXS15231B in QSPI mode streams
+       each frame as a contiguous block starting at y=0, so we must
+       always send the whole panel even though only a sliver changed.
+       The win is on the LVGL rasterize side: with direct_mode, LVGL
+       skips re-rendering the unchanged pixels each frame. */
+    (void)area;
     uint16_t *src = (uint16_t *)color_map;
+
+    const int flush_count = (PH + LVGL_FLUSH_STRIP_ROWS - 1) / LVGL_FLUSH_STRIP_ROWS;
+    const int offgap      = LVGL_FLUSH_STRIP_ROWS;
     int x1 = 0, y1 = 0, x2 = PW, y2 = offgap;
 
     int64_t t_frame_start = esp_timer_get_time();
@@ -407,7 +416,16 @@ static void lvgl_init(esp_lcd_panel_handle_t panel)
     disp_drv.ver_res      = canvas_h;
     disp_drv.flush_cb     = lvgl_flush_cb;
     disp_drv.draw_buf     = &disp_buf;
-    disp_drv.full_refresh = 1;
+    /* direct_mode lets LVGL render only dirty regions into the existing
+       full-canvas framebuffer instead of re-rasterizing every pixel each
+       frame. flush_cb still gets called with the dirty area, but the
+       framebuffer pointer it receives points at the WHOLE canvas, so we
+       can read any pixel from it. We then send full panel-width strips
+       to the AXS15231B (whose QSPI mode does not honour partial-width
+       column windows reliably) but only for the rows the dirty rect
+       intersects. */
+    disp_drv.full_refresh = 0;
+    disp_drv.direct_mode  = 1;
     disp_drv.user_data    = panel;
     lv_disp_drv_register(&disp_drv);
     g_disp_drv = &disp_drv;
