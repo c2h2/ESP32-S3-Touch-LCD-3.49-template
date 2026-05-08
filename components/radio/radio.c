@@ -18,6 +18,7 @@
 
 #include "i2c_bsp.h"   /* esp_i2c_bus_handle */
 #include "radio.h"
+#include "stations.h"
 
 static const char *TAG = "radio";
 
@@ -36,6 +37,8 @@ static i2s_chan_handle_t       s_i2s_tx     = NULL;
 static esp_codec_dev_handle_t  s_codec      = NULL;
 static esp_asp_handle_t        s_player     = NULL;
 static volatile esp_asp_state_t s_state     = ESP_ASP_STATE_NONE;
+static int                     s_cur_idx    = -1;
+static int                     s_volume     = 70;  /* 0..100 */
 
 static int radio_out_cb(uint8_t *data, int data_size, void *ctx)
 {
@@ -65,8 +68,12 @@ static int radio_event_cb(esp_asp_event_pkt_t *pkt, void *ctx)
                 .channel_mask    = 0,
                 .sample_rate     = (uint32_t)info.sample_rate,
             };
+            /* Mute around the close/reopen so the codec doesn't audibly
+               click while the I2S clock retunes for the new sample rate. */
+            esp_codec_dev_set_out_mute(s_codec, true);
             esp_codec_dev_close(s_codec);
             esp_codec_dev_open(s_codec, &fs);
+            esp_codec_dev_set_out_mute(s_codec, false);
         }
     }
     return 0;
@@ -144,7 +151,7 @@ esp_err_t radio_init(void)
     if (!s_codec) { ESP_LOGE(TAG, "codec_dev_new failed"); return ESP_FAIL; }
 
     ESP_LOGI(TAG, "init step 7/8: esp_codec_dev_open");
-    esp_codec_dev_set_out_vol(s_codec, 70);
+    esp_codec_dev_set_out_vol(s_codec, s_volume);
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
         .channel         = 2,
@@ -172,11 +179,28 @@ esp_err_t radio_init(void)
     return ESP_OK;
 }
 
+/* Push N samples of digital silence into the I2S TX so any partial frame
+   left in the DMA ring is overwritten before we mute or change rate. */
+static void codec_drain_silence(void)
+{
+    if (!s_codec) return;
+    static int16_t zero[256] = {0};  /* 64 stereo frames */
+    for (int i = 0; i < 8; i++) {
+        esp_codec_dev_write(s_codec, zero, sizeof(zero));
+    }
+}
+
 esp_err_t radio_play(const char *uri)
 {
     if (!s_player) return ESP_ERR_INVALID_STATE;
     if (!uri || !*uri) return ESP_ERR_INVALID_ARG;
-    esp_audio_simple_player_stop(s_player);  /* idempotent if already stopped */
+    /* Mute first so any junk that bleeds out while tearing down the old
+       pipeline doesn't reach the speaker. radio_event_cb will reopen the
+       codec when the new stream's MUSIC_INFO arrives. */
+    if (s_codec) esp_codec_dev_set_out_mute(s_codec, true);
+    esp_audio_simple_player_stop(s_player);
+    codec_drain_silence();
+    if (s_codec) esp_codec_dev_set_out_mute(s_codec, false);
     ESP_LOGI(TAG, "play: %s", uri);
     esp_gmf_err_t err = esp_audio_simple_player_run(s_player, uri, NULL);
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
@@ -185,7 +209,13 @@ esp_err_t radio_play(const char *uri)
 esp_err_t radio_stop(void)
 {
     if (!s_player) return ESP_ERR_INVALID_STATE;
+    /* Mute -> stop the pipeline -> push silence so the DMA ring is clean ->
+       unmute. Without this the codec keeps draining whatever was last in
+       the buffer and you hear a brief "zzz" tail. */
+    if (s_codec) esp_codec_dev_set_out_mute(s_codec, true);
     esp_audio_simple_player_stop(s_player);
+    codec_drain_silence();
+    /* Stay muted on stop; play() unmutes when the next stream starts. */
     return ESP_OK;
 }
 
@@ -193,3 +223,37 @@ bool radio_is_playing(void)
 {
     return s_state == ESP_ASP_STATE_RUNNING;
 }
+
+int radio_station_count(void) { return RADIO_STATION_COUNT; }
+
+const char *radio_station_name(int idx) {
+    if (idx < 0 || idx >= RADIO_STATION_COUNT) return "";
+    return k_stations[idx].name;
+}
+const char *radio_station_genre(int idx) {
+    if (idx < 0 || idx >= RADIO_STATION_COUNT) return "";
+    return k_stations[idx].genre;
+}
+const char *radio_station_url(int idx) {
+    if (idx < 0 || idx >= RADIO_STATION_COUNT) return "";
+    return k_stations[idx].url;
+}
+
+esp_err_t radio_play_index(int idx)
+{
+    if (idx < 0 || idx >= RADIO_STATION_COUNT) return ESP_ERR_INVALID_ARG;
+    s_cur_idx = idx;
+    return radio_play(k_stations[idx].url);
+}
+
+int radio_current_index(void) { return s_cur_idx; }
+
+void radio_set_volume(int v)
+{
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    s_volume = v;
+    if (s_codec) esp_codec_dev_set_out_vol(s_codec, v);
+}
+
+int radio_get_volume(void) { return s_volume; }
