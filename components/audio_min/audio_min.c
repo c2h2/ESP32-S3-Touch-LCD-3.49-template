@@ -31,6 +31,7 @@ static i2c_master_dev_handle_t es8311_dev = NULL;
 static i2s_chan_handle_t       i2s_tx     = NULL;
 static TaskHandle_t            midi_task  = NULL;
 static volatile bool           is_playing = false;
+static volatile bool           shutdown_req = false;
 static volatile uint16_t       sw_gain_q8 = 256; /* Q8.8 fixed: 256 = unity */
 
 void audio_min_set_volume(uint8_t vol_0_100)
@@ -162,7 +163,7 @@ static void midi_task_fn(void *arg)
                                     MALLOC_CAP_DMA);
     assert(buf);
 
-    while (1) {
+    while (!shutdown_req) {
         if (!is_playing) {
             /* feed silence to keep TX alive */
             memset(buf, 0, BUF_SAMPLES * 2 * sizeof(int16_t));
@@ -172,13 +173,13 @@ static void midi_task_fn(void *arg)
             continue;
         }
 
-        for (size_t n = 0; n < sizeof(TWINKLE)/sizeof(TWINKLE[0]) && is_playing; n++) {
+        for (size_t n = 0; n < sizeof(TWINKLE)/sizeof(TWINKLE[0]) && is_playing && !shutdown_req; n++) {
             uint8_t  midi = TWINKLE[n].midi;
             uint16_t ms   = TWINKLE[n].ms;
             float    hz   = (midi == 0) ? 0.0f : midi_to_hz(midi);
             int total_samples = (int)((uint32_t)SAMPLE_RATE * ms / 1000);
 
-            while (total_samples > 0 && is_playing) {
+            while (total_samples > 0 && is_playing && !shutdown_req) {
                 int chunk = total_samples > BUF_SAMPLES ? BUF_SAMPLES : total_samples;
                 /* small inter-note gap so we hear note boundary */
                 float amp = (total_samples < (int)((uint32_t)SAMPLE_RATE * 30 / 1000))
@@ -191,6 +192,9 @@ static void midi_task_fn(void *arg)
             }
         }
     }
+    free(buf);
+    midi_task = NULL;
+    vTaskDelete(NULL);
 }
 
 esp_err_t audio_min_init(void)
@@ -243,4 +247,24 @@ void audio_min_play_midi(bool play)
 bool audio_min_is_playing(void)
 {
     return is_playing;
+}
+
+void audio_min_shutdown(void)
+{
+    is_playing = false;
+    shutdown_req = true;
+    /* Wait for midi task to exit on its own (it self-deletes after the
+       shutdown flag is observed -- max ~100 ms inside the silence write). */
+    for (int i = 0; i < 50 && midi_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (i2s_tx) {
+        i2s_channel_disable(i2s_tx);
+        i2s_del_channel(i2s_tx);
+        i2s_tx = NULL;
+    }
+    if (es8311_dev) {
+        i2c_master_bus_rm_device(es8311_dev);
+        es8311_dev = NULL;
+    }
 }

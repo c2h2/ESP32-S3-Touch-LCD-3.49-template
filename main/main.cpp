@@ -38,6 +38,8 @@
 #include "sdcard_bsp.h"
 #include "button_bsp.h"
 #include "audio_min.h"
+#include "radio.h"
+#include "cli.h"
 #include "landmask.h"
 #include "tz_cities.h"
 
@@ -1362,6 +1364,141 @@ static void sunmap_update_cb(lv_timer_t *t)
     sunmap_redraw();
 }
 
+/* ---------------------- Radio tile (stage 1: one URL play/stop) ---------------------- */
+
+/* Hard-coded test asset known to work with esp_audio_simple_player. Stage 2
+   replaces this with the curated station list. */
+#define RADIO_STAGE1_URI \
+    "https://dl.espressif.com/dl/audio/gs-16b-2c-44100hz.mp3"
+
+static lv_obj_t  *g_radio_status_lbl = NULL;
+static lv_obj_t  *g_radio_btn_lbl    = NULL;
+static bool       g_radio_engine_up  = false;
+static lv_timer_t *g_radio_poll_timer = NULL;
+
+/* Worker-task command queue. The LVGL click handler enqueues a command and
+   returns immediately so the screen stays responsive; the worker performs
+   the slow I2C / codec / HTTP work and updates a shared status string,
+   which an LVGL timer copies into the on-screen label. */
+typedef enum {
+    RADIO_CMD_NONE = 0,
+    RADIO_CMD_START,
+    RADIO_CMD_STOP,
+} radio_cmd_t;
+
+static volatile radio_cmd_t  g_radio_cmd      = RADIO_CMD_NONE;
+static char                  g_radio_status[64] = "Idle";
+static SemaphoreHandle_t     g_radio_status_mtx = NULL;
+static TaskHandle_t          g_radio_worker     = NULL;
+
+static void radio_set_status(const char *s)
+{
+    if (!g_radio_status_mtx) return;
+    xSemaphoreTake(g_radio_status_mtx, portMAX_DELAY);
+    strncpy(g_radio_status, s, sizeof(g_radio_status) - 1);
+    g_radio_status[sizeof(g_radio_status) - 1] = 0;
+    xSemaphoreGive(g_radio_status_mtx);
+}
+
+static void radio_worker_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        radio_cmd_t cmd = g_radio_cmd;
+        if (cmd == RADIO_CMD_START) {
+            g_radio_cmd = RADIO_CMD_NONE;
+            if (!g_radio_engine_up) {
+                radio_set_status("Engine init...");
+                audio_min_shutdown();
+                if (radio_init() == ESP_OK) g_radio_engine_up = true;
+                else { radio_set_status("Engine init FAILED"); continue; }
+            }
+            radio_set_status("Connecting...");
+            if (radio_play(RADIO_STAGE1_URI) == ESP_OK) radio_set_status("Playing test stream");
+            else                                       radio_set_status("Play FAILED");
+        } else if (cmd == RADIO_CMD_STOP) {
+            g_radio_cmd = RADIO_CMD_NONE;
+            if (g_radio_engine_up) radio_stop();
+            radio_set_status("Stopped");
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void radio_status_poll_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!g_radio_status_lbl || !g_radio_status_mtx) return;
+    char snap[64];
+    xSemaphoreTake(g_radio_status_mtx, portMAX_DELAY);
+    strncpy(snap, g_radio_status, sizeof(snap));
+    xSemaphoreGive(g_radio_status_mtx);
+    lv_label_set_text(g_radio_status_lbl, snap);
+    if (g_radio_btn_lbl) {
+        bool playing = g_radio_engine_up && radio_is_playing();
+        lv_label_set_text(g_radio_btn_lbl, playing ? LV_SYMBOL_STOP : LV_SYMBOL_PLAY);
+    }
+}
+
+static void radio_play_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "radio: play button clicked, engine_up=%d playing=%d",
+             g_radio_engine_up,
+             g_radio_engine_up ? (int)radio_is_playing() : 0);
+    if (!g_radio_status_mtx) g_radio_status_mtx = xSemaphoreCreateMutex();
+    if (!g_radio_worker) {
+        BaseType_t r = xTaskCreatePinnedToCore(radio_worker_task, "radio_wrk",
+                                               6 * 1024, NULL, 4,
+                                               &g_radio_worker, 1);
+        ESP_LOGI(TAG, "radio: worker create -> %d", (int)r);
+    }
+    /* Toggle: if engine thinks it's playing, request stop; else request start. */
+    if (g_radio_engine_up && radio_is_playing()) {
+        ESP_LOGI(TAG, "radio: enqueue STOP");
+        g_radio_cmd = RADIO_CMD_STOP;
+    } else {
+        ESP_LOGI(TAG, "radio: enqueue START");
+        g_radio_cmd = RADIO_CMD_START;
+    }
+}
+
+static void build_radio_tile(lv_obj_t *parent)
+{
+    lv_obj_set_style_bg_color(parent, lv_color_make(0x10, 0x10, 0x18), 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(parent);
+    lv_label_set_text(title, "Internet Radio");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    g_radio_status_lbl = lv_label_create(parent);
+    lv_label_set_text(g_radio_status_lbl, "Idle");
+    lv_obj_set_style_text_color(g_radio_status_lbl, lv_color_make(0xc0, 0xc0, 0xc0), 0);
+    lv_obj_set_style_text_font(g_radio_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(g_radio_status_lbl, LV_ALIGN_CENTER, 0, -4);
+
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 60, 60);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_radius(btn, 30, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_make(0x20, 0x80, 0x40), 0);
+    lv_obj_add_event_cb(btn, radio_play_btn_cb, LV_EVENT_CLICKED, NULL);
+    g_radio_btn_lbl = lv_label_create(btn);
+    lv_label_set_text(g_radio_btn_lbl, LV_SYMBOL_PLAY);
+    lv_obj_set_style_text_color(g_radio_btn_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(g_radio_btn_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(g_radio_btn_lbl);
+
+    /* Mirror the worker's status string into the on-screen label every 200 ms. */
+    if (!g_radio_poll_timer) {
+        g_radio_poll_timer = lv_timer_create(radio_status_poll_cb, 200, NULL);
+    }
+}
+
 /* ---------------------- Hello tile (legacy demo) ---------------------- */
 
 static void build_hello_tile(lv_obj_t *parent, const char *status_text)
@@ -2195,14 +2332,17 @@ static void build_main_ui(const char *status_text)
 
     /* Tile 0: clock with the world daylight map as its background.
        Tile 1: settings (Wi-Fi, time, display).
-       Tile 2: legacy hello-world demo screen. */
+       Tile 2: legacy hello-world demo screen.
+       Tile 3: internet radio (stage 1 = one hard-coded URL). */
     lv_obj_t *t_clock = lv_tileview_add_tile(g_tileview, 0, 0, LV_DIR_RIGHT);
     lv_obj_t *t_set   = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    lv_obj_t *t_hello = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT);
+    lv_obj_t *t_hello = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    lv_obj_t *t_radio = lv_tileview_add_tile(g_tileview, 3, 0, LV_DIR_LEFT);
 
     build_clock_tile(t_clock);
     build_settings_tile(t_set);
     build_hello_tile(t_hello, status_text);
+    build_radio_tile(t_radio);
 
     /* FPS overlay: parented to the screen (not the tileview) so it
        floats above every tile. */
@@ -2405,6 +2545,7 @@ extern "C" void app_main(void)
 
     show_main_ui(status);
     ESP_LOGI(TAG, "===== All drivers initialized =====");
+    cli_start();
 
     /* Auto-connect at boot using whatever NVS has stored, unless the
        user disabled it in Settings. */

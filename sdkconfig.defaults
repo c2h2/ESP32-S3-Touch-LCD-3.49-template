@@ -29,3 +29,10 @@ CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 CONFIG_LV_FONT_UNSCII_16=y
 CONFIG_LV_FONT_FMT_TXT_LARGE=y
+# Primary console = USB-Serial-JTAG (same port as idf.py monitor on this board)
+# so the host can both watch logs and send shell commands over /dev/cu.usbmodem*.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Allow mbedtls to allocate from PSRAM. Internal RAM is fragmented after the
+# LVGL widget tree is built so SSL setup (~30 KB ctx) used to fail with
+# ESP_ERR_MBEDTLS_SSL_SETUP_FAILED on https streams.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

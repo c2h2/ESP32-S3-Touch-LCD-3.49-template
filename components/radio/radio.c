@@ -1,0 +1,195 @@
+/* radio.c -- internet-radio engine: HTTP/HTTPS stream -> esp_audio_simple_player
+ * -> esp_codec_dev (ES8311 over I2C+I2S). Stage-1 minimum: bring up the codec,
+ * play a URI, stop on demand. ICY metadata, station list, and player UI live
+ * one layer up. */
+
+#include <string.h>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "driver/i2s_std.h"
+#include "driver/i2c_master.h"
+
+#include "esp_codec_dev_defaults.h"
+#include "esp_codec_dev.h"
+
+#include "esp_audio_simple_player.h"
+
+#include "i2c_bsp.h"   /* esp_i2c_bus_handle */
+#include "radio.h"
+
+static const char *TAG = "radio";
+
+/* Same wiring as audio_min/audio_min.c */
+#define PIN_I2S_MCLK   GPIO_NUM_7
+#define PIN_I2S_BCLK   GPIO_NUM_15
+#define PIN_I2S_LRCK   GPIO_NUM_46
+#define PIN_I2S_DOUT   GPIO_NUM_45
+#define PIN_I2S_DIN    GPIO_NUM_6
+/* esp_codec_dev's audio_codec_new_i2c_ctrl shifts the addr right by 1 before
+   handing it to i2c_master_bus_add_device, so we pass the 8-bit form here.
+   ES8311's 7-bit slave address is 0x18 -> 8-bit form 0x30. */
+#define ES8311_I2C_ADDR 0x30
+
+static i2s_chan_handle_t       s_i2s_tx     = NULL;
+static esp_codec_dev_handle_t  s_codec      = NULL;
+static esp_asp_handle_t        s_player     = NULL;
+static volatile esp_asp_state_t s_state     = ESP_ASP_STATE_NONE;
+
+static int radio_out_cb(uint8_t *data, int data_size, void *ctx)
+{
+    (void)ctx;
+    if (!s_codec || !data || data_size <= 0) return 0;
+    int err = esp_codec_dev_write(s_codec, data, data_size);
+    return err == ESP_CODEC_DEV_OK ? data_size : 0;
+}
+
+static int radio_event_cb(esp_asp_event_pkt_t *pkt, void *ctx)
+{
+    (void)ctx;
+    if (pkt->type == ESP_ASP_EVENT_TYPE_STATE) {
+        esp_asp_state_t st = ESP_ASP_STATE_NONE;
+        memcpy(&st, pkt->payload, pkt->payload_size);
+        s_state = st;
+        ESP_LOGI(TAG, "state -> %s", esp_audio_simple_player_state_to_str(st));
+    } else if (pkt->type == ESP_ASP_EVENT_TYPE_MUSIC_INFO) {
+        esp_asp_music_info_t info = {0};
+        memcpy(&info, pkt->payload, pkt->payload_size);
+        ESP_LOGI(TAG, "music info: rate=%d ch=%d bits=%d",
+                 info.sample_rate, info.channels, info.bits);
+        if (s_codec) {
+            esp_codec_dev_sample_info_t fs = {
+                .bits_per_sample = info.bits,
+                .channel         = info.channels,
+                .channel_mask    = 0,
+                .sample_rate     = (uint32_t)info.sample_rate,
+            };
+            esp_codec_dev_close(s_codec);
+            esp_codec_dev_open(s_codec, &fs);
+        }
+    }
+    return 0;
+}
+
+esp_err_t radio_init(void)
+{
+    if (s_player) {
+        ESP_LOGI(TAG, "init: already up");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "init step 1/8: i2s_new_channel");
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num  = 6;
+    chan_cfg.dma_frame_num = 240;
+    esp_err_t er = i2s_new_channel(&chan_cfg, &s_i2s_tx, NULL);
+    if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_new_channel: %s", esp_err_to_name(er)); return er; }
+
+    ESP_LOGI(TAG, "init step 2/8: i2s_channel_init_std_mode @ 44100");
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                       I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = PIN_I2S_MCLK,
+            .bclk = PIN_I2S_BCLK,
+            .ws   = PIN_I2S_LRCK,
+            .dout = PIN_I2S_DOUT,
+            .din  = PIN_I2S_DIN,
+        },
+    };
+    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    er = i2s_channel_init_std_mode(s_i2s_tx, &std_cfg);
+    if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_init_std: %s", esp_err_to_name(er)); return er; }
+    er = i2s_channel_enable(s_i2s_tx);
+    if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_enable: %s", esp_err_to_name(er)); return er; }
+
+    ESP_LOGI(TAG, "init step 3/8: audio_codec_new_i2c_ctrl bus=%p addr=0x%02x",
+             esp_i2c_bus_handle, ES8311_I2C_ADDR);
+    audio_codec_i2c_cfg_t i2c_cfg = {
+        .addr    = ES8311_I2C_ADDR,
+        .bus_handle = esp_i2c_bus_handle,
+    };
+    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    if (!ctrl_if) { ESP_LOGE(TAG, "i2c ctrl create failed"); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "init step 4/8: audio_codec_new_i2s_data");
+    audio_codec_i2s_cfg_t i2s_cfg = {
+        .port      = I2S_NUM_0,
+        .tx_handle = s_i2s_tx,
+        .rx_handle = NULL,
+    };
+    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
+    if (!data_if) { ESP_LOGE(TAG, "i2s data create failed"); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "init step 5/8: es8311_codec_new");
+    es8311_codec_cfg_t es_cfg = {
+        .ctrl_if   = ctrl_if,
+        .gpio_if   = audio_codec_new_gpio(),
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .master_mode = false,
+        .use_mclk  = true,
+    };
+    const audio_codec_if_t *codec_if = es8311_codec_new(&es_cfg);
+    if (!codec_if) { ESP_LOGE(TAG, "es8311_codec_new failed"); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "init step 6/8: esp_codec_dev_new");
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = codec_if,
+        .data_if  = data_if,
+    };
+    s_codec = esp_codec_dev_new(&dev_cfg);
+    if (!s_codec) { ESP_LOGE(TAG, "codec_dev_new failed"); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "init step 7/8: esp_codec_dev_open");
+    esp_codec_dev_set_out_vol(s_codec, 70);
+    esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = 16,
+        .channel         = 2,
+        .sample_rate     = 44100,
+    };
+    int rc = esp_codec_dev_open(s_codec, &fs);
+    if (rc != ESP_CODEC_DEV_OK) { ESP_LOGE(TAG, "codec_dev_open: rc=%d", rc); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "init step 8/8: esp_audio_simple_player_new");
+    esp_asp_cfg_t cfg = {
+        .out.cb       = radio_out_cb,
+        .out.user_ctx = NULL,
+        .task_prio    = 5,
+        .task_stack   = 8 * 1024,
+        .task_stack_in_ext = true,
+        .task_core    = 1,
+    };
+    esp_gmf_err_t err = esp_audio_simple_player_new(&cfg, &s_player);
+    if (err != ESP_OK || !s_player) {
+        ESP_LOGE(TAG, "player_new: err=%d", (int)err);
+        return ESP_FAIL;
+    }
+    esp_audio_simple_player_set_event(s_player, radio_event_cb, NULL);
+    ESP_LOGI(TAG, "radio engine ready");
+    return ESP_OK;
+}
+
+esp_err_t radio_play(const char *uri)
+{
+    if (!s_player) return ESP_ERR_INVALID_STATE;
+    if (!uri || !*uri) return ESP_ERR_INVALID_ARG;
+    esp_audio_simple_player_stop(s_player);  /* idempotent if already stopped */
+    ESP_LOGI(TAG, "play: %s", uri);
+    esp_gmf_err_t err = esp_audio_simple_player_run(s_player, uri, NULL);
+    return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t radio_stop(void)
+{
+    if (!s_player) return ESP_ERR_INVALID_STATE;
+    esp_audio_simple_player_stop(s_player);
+    return ESP_OK;
+}
+
+bool radio_is_playing(void)
+{
+    return s_state == ESP_ASP_STATE_RUNNING;
+}
