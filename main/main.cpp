@@ -1281,7 +1281,7 @@ static void build_clock_tile(lv_obj_t *parent)
     g_clock_date_label = lv_label_create(parent);
     lv_label_set_text(g_clock_date_label, "----.--.--");
     lv_obj_set_style_text_color(g_clock_date_label, lv_color_make(0xd0, 0xd0, 0xd0), 0);
-    lv_obj_set_style_text_font(g_clock_date_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(g_clock_date_label, i18n_font(), 0);
     lv_obj_set_style_bg_color(g_clock_date_label, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(g_clock_date_label, LV_OPA_70, 0);
     lv_obj_set_style_pad_hor(g_clock_date_label, 6, 0);
@@ -1313,7 +1313,7 @@ static void build_clock_tile(lv_obj_t *parent)
     g_clock_tz_label = lv_label_create(parent);
     lv_label_set_text(g_clock_tz_label, tz_current_city_name());
     lv_obj_set_style_text_color(g_clock_tz_label, lv_color_make(0xa0, 0xa0, 0xa0), 0);
-    lv_obj_set_style_text_font(g_clock_tz_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_clock_tz_label, i18n_font(), 0);
     lv_obj_set_style_bg_color(g_clock_tz_label, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(g_clock_tz_label, LV_OPA_60, 0);
     lv_obj_set_style_pad_hor(g_clock_tz_label, 4, 0);
@@ -1324,7 +1324,7 @@ static void build_clock_tile(lv_obj_t *parent)
     lv_label_set_text(g_clock_wifi_icon, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_color(g_clock_wifi_icon,
                                  lv_color_make(0x40, 0x40, 0x40), 0);
-    lv_obj_set_style_text_font(g_clock_wifi_icon, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_clock_wifi_icon, i18n_font(), 0);
     lv_obj_set_style_bg_color(g_clock_wifi_icon, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(g_clock_wifi_icon, LV_OPA_60, 0);
     lv_obj_set_style_pad_hor(g_clock_wifi_icon, 3, 0);
@@ -1334,7 +1334,7 @@ static void build_clock_tile(lv_obj_t *parent)
     lv_label_set_text(g_clock_bt_icon, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_color(g_clock_bt_icon,
                                  lv_color_make(0x40, 0x40, 0x40), 0);
-    lv_obj_set_style_text_font(g_clock_bt_icon, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_clock_bt_icon, i18n_font(), 0);
     lv_obj_set_style_bg_color(g_clock_bt_icon, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(g_clock_bt_icon, LV_OPA_60, 0);
     lv_obj_set_style_pad_hor(g_clock_bt_icon, 3, 0);
@@ -1603,7 +1603,7 @@ static void build_radio_tile(lv_obj_t *parent)
                               radio_station_name(i),
                               radio_station_genre(i));
         lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(lbl, i18n_font(), 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
     }
 
@@ -1620,7 +1620,7 @@ static void build_radio_tile(lv_obj_t *parent)
     lv_obj_t *header = lv_label_create(info);
     lv_label_set_text_fmt(header, LV_SYMBOL_AUDIO "  %s", tr(I18N_RADIO_NOW_PLAYING));
     lv_obj_set_style_text_color(header, lv_color_make(0xa0, 0xa0, 0xc0), 0);
-    lv_obj_set_style_text_font(header, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(header, i18n_font(), 0);
     lv_obj_align(header, LV_ALIGN_TOP_LEFT, 0, 0);
 
     g_radio_now_lbl = lv_label_create(info);
@@ -1628,7 +1628,7 @@ static void build_radio_tile(lv_obj_t *parent)
     lv_obj_set_width(g_radio_now_lbl, INFO_W - 12);
     lv_label_set_text(g_radio_now_lbl, tr(I18N_RADIO_NO_STATION));
     lv_obj_set_style_text_color(g_radio_now_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(g_radio_now_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(g_radio_now_lbl, i18n_font(), 0);
     lv_obj_align(g_radio_now_lbl, LV_ALIGN_TOP_LEFT, 0, 18);
 
     g_radio_status_lbl = lv_label_create(info);
@@ -1636,7 +1636,7 @@ static void build_radio_tile(lv_obj_t *parent)
     lv_obj_set_width(g_radio_status_lbl, INFO_W - 12);
     lv_label_set_text(g_radio_status_lbl, tr(I18N_IDLE));
     lv_obj_set_style_text_color(g_radio_status_lbl, lv_color_make(0xc0, 0xc0, 0xc0), 0);
-    lv_obj_set_style_text_font(g_radio_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_radio_status_lbl, i18n_font(), 0);
     lv_obj_align(g_radio_status_lbl, LV_ALIGN_TOP_LEFT, 0, 70);
 
     /* Bottom row: [-]  Vol N  [+]                             [play] */
@@ -1649,13 +1649,13 @@ static void build_radio_tile(lv_obj_t *parent)
     lv_obj_t *vol_dn_l = lv_label_create(vol_dn);
     lv_label_set_text(vol_dn_l, LV_SYMBOL_MINUS);
     lv_obj_set_style_text_color(vol_dn_l, lv_color_white(), 0);
-    lv_obj_set_style_text_font(vol_dn_l, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(vol_dn_l, i18n_font(), 0);
     lv_obj_center(vol_dn_l);
 
     g_radio_vol_lbl = lv_label_create(info);
     lv_label_set_text_fmt(g_radio_vol_lbl, tr(I18N_VOL_N), radio_get_volume());
     lv_obj_set_style_text_color(g_radio_vol_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(g_radio_vol_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_radio_vol_lbl, i18n_font(), 0);
     lv_obj_align(g_radio_vol_lbl, LV_ALIGN_BOTTOM_LEFT, 36, -10);
 
     lv_obj_t *vol_up = lv_btn_create(info);
@@ -1667,7 +1667,7 @@ static void build_radio_tile(lv_obj_t *parent)
     lv_obj_t *vol_up_l = lv_label_create(vol_up);
     lv_label_set_text(vol_up_l, LV_SYMBOL_PLUS);
     lv_obj_set_style_text_color(vol_up_l, lv_color_white(), 0);
-    lv_obj_set_style_text_font(vol_up_l, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(vol_up_l, i18n_font(), 0);
     lv_obj_center(vol_up_l);
 
     lv_obj_t *btn = lv_btn_create(info);
@@ -1679,7 +1679,7 @@ static void build_radio_tile(lv_obj_t *parent)
     g_radio_btn_lbl = lv_label_create(btn);
     lv_label_set_text(g_radio_btn_lbl, LV_SYMBOL_PLAY);
     lv_obj_set_style_text_color(g_radio_btn_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(g_radio_btn_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(g_radio_btn_lbl, i18n_font(), 0);
     lv_obj_center(g_radio_btn_lbl);
 
     if (!g_radio_poll_timer) {
@@ -1700,7 +1700,7 @@ static void build_hello_tile(lv_obj_t *parent, const char *status_text)
     lv_obj_set_width(hello, canvas_w / 3);
     lv_label_set_text(hello, "Hello World  *  Hello World  *  Hello World  *  ");
     lv_obj_set_style_text_color(hello, lv_color_white(), 0);
-    lv_obj_set_style_text_font(hello, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(hello, i18n_font(), 0);
     lv_obj_set_style_anim_speed(hello, 40, 0);
     lv_obj_set_style_text_align(hello, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_align(hello, LV_ALIGN_TOP_MID, 0, 8);
@@ -1710,7 +1710,7 @@ static void build_hello_tile(lv_obj_t *parent, const char *status_text)
     lv_obj_set_width(status, canvas_w - 20);
     lv_label_set_text(status, status_text);
     lv_obj_set_style_text_color(status, lv_color_make(0xa0, 0xa0, 0xa0), 0);
-    lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(status, i18n_font(), 0);
     lv_obj_set_style_text_align(status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(status, LV_ALIGN_CENTER, 0, 0);
 
@@ -1724,7 +1724,7 @@ static void build_hello_tile(lv_obj_t *parent, const char *status_text)
     play_btn_label = lv_label_create(play_btn);
     lv_label_set_text(play_btn_label, audio_min_is_playing() ? LV_SYMBOL_STOP : LV_SYMBOL_PLAY);
     lv_obj_set_style_text_color(play_btn_label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(play_btn_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(play_btn_label, i18n_font(), 0);
     lv_obj_center(play_btn_label);
 
     /* Rotate button */
@@ -1737,7 +1737,7 @@ static void build_hello_tile(lv_obj_t *parent, const char *status_text)
     lv_obj_t *rot_label = lv_label_create(rot_btn);
     lv_label_set_text(rot_label, LV_SYMBOL_REFRESH);
     lv_obj_set_style_text_color(rot_label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(rot_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(rot_label, i18n_font(), 0);
     lv_obj_center(rot_label);
 
 }
@@ -1879,7 +1879,7 @@ static void kb_open_for_ssid(const char *ssid)
     lv_textarea_set_placeholder_text(g_set_kb_ta, ph);
     lv_obj_set_size(g_set_kb_ta, canvas_w - EYE_W, TA_H);
     lv_obj_align(g_set_kb_ta, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_style_text_font(g_set_kb_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_set_kb_ta, i18n_font(), 0);
     lv_obj_set_style_pad_top(g_set_kb_ta, 1, 0);
     lv_obj_set_style_pad_bottom(g_set_kb_ta, 1, 0);
     lv_obj_set_style_pad_left(g_set_kb_ta, 6, 0);
@@ -1898,7 +1898,7 @@ static void kb_open_for_ssid(const char *ssid)
     lv_obj_t *eye_lbl = lv_label_create(eye);
     lv_label_set_text(eye_lbl, LV_SYMBOL_EYE_CLOSE);
     lv_obj_set_style_text_color(eye_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(eye_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(eye_lbl, i18n_font(), 0);
     lv_obj_center(eye_lbl);
     lv_obj_add_event_cb(eye, [](lv_event_t *e) {
         lv_obj_t *btn = lv_event_get_target(e);
@@ -2007,7 +2007,7 @@ static void set_render_wifi_list(void)
         lv_obj_t *empty = lv_label_create(g_set_wifi_list);
         lv_label_set_text(empty, tr(I18N_WIFI_NO_APS));
         lv_obj_set_style_text_color(empty, lv_color_make(0xa0, 0xa0, 0xa0), 0);
-        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(empty, i18n_font(), 0);
         return;
     }
     for (int i = 0; i < g_wifi_scan_n; i++) {
@@ -2041,7 +2041,7 @@ static void set_render_wifi_list(void)
         if (is_connected) col = lv_color_make(0x40, 0xc0, 0x80);
         else if (is_saved) col = lv_color_make(0xa0, 0xc0, 0xff);
         lv_obj_set_style_text_color(l, col, 0);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(l, i18n_font(), 0);
         lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
     }
 }
@@ -2345,14 +2345,14 @@ static lv_obj_t *build_subpage_wifi(lv_obj_t *menu)
     lv_label_set_text_fmt(g_set_wifi_status, "%s",
                           g_wifi_connected ? g_wifi_curr_ssid : tr(I18N_WIFI_NOT_CONN));
     lv_obj_set_style_text_color(g_set_wifi_status, lv_color_make(0xc0, 0xc0, 0xc0), 0);
-    lv_obj_set_style_text_font(g_set_wifi_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_set_wifi_status, i18n_font(), 0);
 
     /* Scan button */
     lv_obj_t *scan_btn = lv_btn_create(side);
     lv_obj_set_size(scan_btn, lv_pct(100), 24);
     lv_obj_t *scan_l = lv_label_create(scan_btn);
     lv_label_set_text(scan_l, tr(I18N_WIFI_SCAN_BTN));
-    lv_obj_set_style_text_font(scan_l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(scan_l, i18n_font(), 0);
     lv_obj_center(scan_l);
     lv_obj_add_event_cb(scan_btn, scan_btn_cb, LV_EVENT_CLICKED, NULL);
 
@@ -2363,7 +2363,7 @@ static lv_obj_t *build_subpage_wifi(lv_obj_t *menu)
     lv_obj_t *conn_l = lv_label_create(conn_btn);
     lv_label_set_text(conn_l, tr(I18N_WIFI_CONNECT_BTN));
     lv_obj_set_style_text_color(conn_l, lv_color_white(), 0);
-    lv_obj_set_style_text_font(conn_l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(conn_l, i18n_font(), 0);
     lv_obj_center(conn_l);
     lv_obj_add_event_cb(conn_btn, wifi_connect_selected_cb, LV_EVENT_CLICKED, NULL);
 
@@ -2374,7 +2374,7 @@ static lv_obj_t *build_subpage_wifi(lv_obj_t *menu)
     lv_obj_t *forget_l = lv_label_create(forget_btn);
     lv_label_set_text(forget_l, tr(I18N_WIFI_FORGET_BTN));
     lv_obj_set_style_text_color(forget_l, lv_color_white(), 0);
-    lv_obj_set_style_text_font(forget_l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(forget_l, i18n_font(), 0);
     lv_obj_center(forget_l);
     lv_obj_add_event_cb(forget_btn, wifi_forget_selected_cb, LV_EVENT_CLICKED, NULL);
 
@@ -2391,7 +2391,7 @@ static lv_obj_t *build_subpage_tz_city_list(lv_obj_t *menu, uint16_t first, uint
         lv_obj_t *cont = lv_menu_cont_create(page);
         lv_obj_t *l    = lv_label_create(cont);
         lv_label_set_text(l, k_tz_cities[i].name);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(l, i18n_font(), 0);
         if (i == g_cfg.tz_idx) {
             lv_obj_set_style_text_color(l, lv_color_make(0x40, 0xc0, 0x80), 0);
         }
@@ -2417,7 +2417,7 @@ static lv_obj_t *build_subpage_tz(lv_obj_t *menu)
         lv_obj_t *cont = lv_menu_cont_create(page);
         lv_obj_t *l    = lv_label_create(cont);
         lv_label_set_text(l, k_tz_continents[c].name);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(l, i18n_font(), 0);
         lv_menu_set_load_page_event(menu, cont, city_page);
     }
     return page;
@@ -2434,7 +2434,7 @@ static lv_obj_t *build_subpage_brightness(lv_obj_t *menu)
     lv_obj_t *l = lv_label_create(cont);
     lv_label_set_text(l, tr(I18N_BACKLIGHT_LEVEL));
     lv_obj_set_style_text_color(l, lv_color_white(), 0);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(l, i18n_font(), 0);
 
     lv_obj_t *bri_s = lv_slider_create(cont);
     lv_obj_set_width(bri_s, lv_pct(95));
@@ -2463,7 +2463,7 @@ static lv_obj_t *build_subpage_autodim(lv_obj_t *menu)
         else                  lv_label_set_text_fmt(dim_lbl, tr(I18N_DIM_AFTER), d);
     }
     lv_obj_set_style_text_color(dim_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(dim_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(dim_lbl, i18n_font(), 0);
     lv_obj_t *dim_s = lv_slider_create(cont);
     lv_obj_set_width(dim_s, lv_pct(95));
     lv_slider_set_range(dim_s, 0, IDLE_SLIDER_MAX);
@@ -2482,7 +2482,7 @@ static lv_obj_t *build_subpage_autodim(lv_obj_t *menu)
         else                  lv_label_set_text_fmt(off_lbl, tr(I18N_SLEEP_AFTER), d);
     }
     lv_obj_set_style_text_color(off_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(off_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(off_lbl, i18n_font(), 0);
     lv_obj_t *off_s = lv_slider_create(cont);
     lv_obj_set_width(off_s, lv_pct(95));
     lv_slider_set_range(off_s, 0, IDLE_SLIDER_MAX);
@@ -2508,7 +2508,7 @@ static lv_obj_t *add_toggle_row(lv_obj_t *parent, const char *label,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *l = lv_label_create(row);
     lv_label_set_text(l, label);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(l, i18n_font(), 0);
     lv_obj_t *sw = lv_switch_create(row);
     if (checked) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -2562,7 +2562,7 @@ static lv_obj_t *build_subpage_display(lv_obj_t *menu)
 
     lv_obj_t *df_l = lv_label_create(cont);
     lv_label_set_text(df_l, tr(I18N_DATE_FORMAT));
-    lv_obj_set_style_text_font(df_l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(df_l, i18n_font(), 0);
     lv_obj_t *df = lv_dropdown_create(cont);
     lv_dropdown_set_options_static(df,
         "YYYY.MM.DD\nDD.MM.YYYY\nMM.DD.YYYY");
@@ -2571,7 +2571,7 @@ static lv_obj_t *build_subpage_display(lv_obj_t *menu)
 
     lv_obj_t *th_l = lv_label_create(cont);
     lv_label_set_text(th_l, tr(I18N_THEME));
-    lv_obj_set_style_text_font(th_l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(th_l, i18n_font(), 0);
     lv_obj_t *th = lv_dropdown_create(cont);
     /* Build a "Dark\nLight\nHigh contrast"-style options string in a static
        buffer so the dropdown can keep using it. Refreshed on each entry to
@@ -2598,7 +2598,7 @@ static lv_obj_t *build_subpage_sound(lv_obj_t *menu)
 
     lv_obj_t *vol_lbl = lv_label_create(cont);
     lv_label_set_text_fmt(vol_lbl, tr(I18N_VOLUME_PCT), (unsigned)g_cfg.audio_volume);
-    lv_obj_set_style_text_font(vol_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(vol_lbl, i18n_font(), 0);
 
     lv_obj_t *vol_s = lv_slider_create(cont);
     lv_obj_set_width(vol_s, lv_pct(95));
@@ -2621,7 +2621,7 @@ static lv_obj_t *build_subpage_reset(lv_obj_t *menu)
 
     lv_obj_t *l = lv_label_create(cont);
     lv_label_set_text(l, tr(I18N_RESET_WARN));
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(l, i18n_font(), 0);
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(l, lv_pct(95));
 
@@ -2632,7 +2632,7 @@ static lv_obj_t *build_subpage_reset(lv_obj_t *menu)
     lv_obj_t *bl = lv_label_create(btn);
     lv_label_set_text(bl, tr(I18N_RESET_BTN));
     lv_obj_set_style_text_color(bl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(bl, i18n_font(), 0);
     lv_obj_center(bl);
     lv_obj_add_event_cb(btn, reset_confirm_cb, LV_EVENT_CLICKED, NULL);
 
@@ -2689,7 +2689,7 @@ static void build_settings_tile(lv_obj_t *parent)
         lv_obj_set_flex_grow(title_lbl, 1);
         lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(title_lbl, lv_color_white(), 0);
-        lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(title_lbl, i18n_font(), 0);
     }
     lv_obj_t *back = lv_menu_get_main_header_back_btn(menu);
     if (back) {
@@ -2708,7 +2708,7 @@ static void build_settings_tile(lv_obj_t *parent)
         lv_obj_t *txt = lv_label_create(back);
         lv_label_set_text_fmt(txt, LV_SYMBOL_LEFT " %s", tr(I18N_BACK));
         lv_obj_set_style_text_color(txt, lv_color_white(), 0);
-        lv_obj_set_style_text_font(txt, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(txt, i18n_font(), 0);
         lv_obj_center(txt);
     }
 
@@ -2801,7 +2801,7 @@ static void build_main_ui(const char *status_text)
     fps_label = lv_label_create(scr);
     lv_label_set_text(fps_label, "FPS --");
     lv_obj_set_style_text_color(fps_label, lv_color_make(0x00, 0xff, 0x80), 0);
-    lv_obj_set_style_text_font(fps_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(fps_label, i18n_font(), 0);
     lv_obj_set_style_bg_color(fps_label, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(fps_label, LV_OPA_60, 0);
     lv_obj_set_style_pad_hor(fps_label, 3, 0);
