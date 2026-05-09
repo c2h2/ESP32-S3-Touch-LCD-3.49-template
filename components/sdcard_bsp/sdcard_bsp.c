@@ -34,7 +34,10 @@ void _sdcard_init(void)
   };
 
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-  host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;//高速
+  /* Drop from highspeed (40 MHz) to default (20 MHz). High-speed needs
+     clean signal integrity that the on-board mux + 1-bit wiring may not
+     deliver, and the card_init -> EACCES failure is typical of this. */
+  host.max_freq_khz = SDMMC_FREQ_DEFAULT;
 
   sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
   slot_config.width = 1;           //1线

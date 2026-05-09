@@ -28,7 +28,13 @@
 
 #include "audio_min.h"
 #include "radio.h"
+#include "recorder.h"
 #include "cli.h"
+
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#include "esp_vfs_fat.h"
 
 static const char *TAG = "cli";
 
@@ -115,6 +121,92 @@ static int cmd_lang(int argc, char **argv)
     int idx = s_lang_args.idx->ival[0];
     app_cfg_set_lang(idx);
     printf("lang -> %d (reboot or re-enter menu to refresh labels)\n", idx);
+    return 0;
+}
+
+static int cmd_bl(int argc, char **argv)
+{
+    if (argc < 2) { printf("usage: bl <0..255>\n"); return 1; }
+    int v = atoi(argv[1]);
+    app_cfg_set_brightness(v);
+    printf("brightness=%d\n", v);
+    return 0;
+}
+
+static int cmd_no_sleep(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    app_cfg_set_dim_off(0, 0);
+    printf("dim_s=0 off_s=0 (never dim/off)\n");
+    return 0;
+}
+
+static int cmd_rec_start(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    const char *p = NULL;
+    esp_err_t r = recorder_start(&p);
+    printf("recorder_start -> %s (path=%s)\n", esp_err_to_name(r), p ? p : "?");
+    return r == ESP_OK ? 0 : 1;
+}
+
+static int cmd_rec_stop(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    esp_err_t r = recorder_stop();
+    printf("recorder_stop -> %s\n", esp_err_to_name(r));
+    return 0;
+}
+
+static int cmd_rec_list(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    static char names[16][64];
+    int n = recorder_list(names, 16);
+    printf("recordings: %d\n", n);
+    for (int i = 0; i < n; i++) printf("  %s\n", names[i]);
+    return 0;
+}
+
+static int cmd_rec_status(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("recording=%d elapsed=%us\n",
+           (int)recorder_is_recording(), recorder_elapsed_s());
+    return 0;
+}
+
+static int cmd_sd_info(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    uint64_t total = 0, free = 0;
+    if (esp_vfs_fat_info("/sdcard", &total, &free) != ESP_OK || total == 0) {
+        printf("sd: not mounted\n");
+        return 1;
+    }
+    printf("sd: total=%llu MB free=%llu MB (%.1f%%)\n",
+           total / (1024ULL*1024), free / (1024ULL*1024),
+           total ? (100.0 * free / total) : 0.0);
+    return 0;
+}
+
+static int cmd_sd_format(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* Wipe everything in /sdcard/recordings; we don't actually re-format
+       the FAT (that would need esp_vfs_fat_sdmmc_format which the bsp
+       doesn't expose). Good enough for "clear out my clips". */
+    DIR *d = opendir("/sdcard/recordings");
+    if (!d) { printf("nothing to clear\n"); return 0; }
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char p[300]; snprintf(p, sizeof(p), "/sdcard/recordings/%s", e->d_name);
+        if (unlink(p) == 0) n++;
+    }
+    closedir(d);
+    printf("cleared %d files\n", n);
     return 0;
 }
 
@@ -210,6 +302,14 @@ void cli_start(void)
         { .command = "radio_stop",   .help = "stop radio playback",             .func = &cmd_radio_stop },
         { .command = "radio_status", .help = "show radio playing state",        .func = &cmd_radio_status },
         { .command = "radio_test",   .help = "audio_off -> radio_init -> play test URL", .func = &cmd_radio_test },
+        { .command = "rec_start",    .help = "start a recording", .func = &cmd_rec_start },
+        { .command = "rec_stop",     .help = "stop the recording", .func = &cmd_rec_stop },
+        { .command = "rec_list",     .help = "list recordings on SD", .func = &cmd_rec_list },
+        { .command = "rec_status",   .help = "is the recorder running?", .func = &cmd_rec_status },
+        { .command = "sd_info",      .help = "SD card free/total bytes", .func = &cmd_sd_info },
+        { .command = "sd_format",    .help = "delete all files in /sdcard/recordings", .func = &cmd_sd_format },
+        { .command = "bl",           .help = "set backlight 0..255 (e.g. bl 255)", .func = &cmd_bl },
+        { .command = "no_sleep",     .help = "disable dim/off (sets dim_s=off_s=0)", .func = &cmd_no_sleep },
     };
     for (size_t i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++) {
         esp_console_cmd_register(&cmds[i]);

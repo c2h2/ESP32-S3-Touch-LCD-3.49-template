@@ -3,6 +3,9 @@
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
+#include <dirent.h>
+#include <unistd.h>
+#include "esp_vfs_fat.h"
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -39,6 +42,7 @@
 #include "button_bsp.h"
 #include "audio_min.h"
 #include "radio.h"
+#include "recorder.h"
 #include "cli.h"
 #include "i18n.h"
 #include "landmask.h"
@@ -113,6 +117,7 @@ static app_cfg_t g_cfg = {
 
 static void cfg_load(void);
 static bool menu_input_blocked(void);
+static void recorder_refresh_list(void);
 static void cfg_save(void);
 static void cfg_save_ssid_pass(const char *ssid, const char *pass);
 static bool cfg_get_ssid_pass(const char *ssid, char *pass, size_t pass_len);
@@ -969,6 +974,29 @@ extern "C" void app_cfg_set_lang(int lang)
     if (lang < 0) lang = 0;
     if (lang >= I18N_LANG_COUNT) lang = 0;
     g_cfg.lang = (uint8_t)lang;
+    cfg_save();
+}
+
+extern "C" void app_cfg_set_brightness(int v)
+{
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    g_cfg.brightness = (uint8_t)v;
+    g_dim_state = 0;
+    g_last_activity_ms = lv_tick_get();
+    backlight_apply(g_cfg.brightness);
+    cfg_save();
+}
+
+extern "C" void app_cfg_set_dim_off(int dim_s, int off_s)
+{
+    if (dim_s < 0) dim_s = 0;
+    if (off_s < 0) off_s = 0;
+    g_cfg.dim_s = (uint16_t)dim_s;
+    g_cfg.off_s = (uint16_t)off_s;
+    g_dim_state = 0;
+    g_last_activity_ms = lv_tick_get();
+    backlight_apply(g_cfg.brightness);
     cfg_save();
 }
 
@@ -2694,6 +2722,62 @@ static lv_obj_t *build_subpage_reset(lv_obj_t *menu)
     return page;
 }
 
+static void sd_clear_cb(lv_event_t *e)
+{
+    (void)e;
+    if (menu_input_blocked()) return;
+    DIR *d = opendir("/sdcard/recordings");
+    int n = 0;
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char p[300]; snprintf(p, sizeof(p), "/sdcard/recordings/%s", de->d_name);
+            if (unlink(p) == 0) n++;
+        }
+        closedir(d);
+    }
+    ESP_LOGI(TAG, "sd_clear: removed %d files", n);
+    recorder_refresh_list();
+}
+
+static lv_obj_t *build_subpage_storage(lv_obj_t *menu)
+{
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_STORAGE));
+    lv_obj_t *cont = lv_menu_cont_create(page);
+    lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(cont, 6, 0);
+
+    /* Live SD info: total/free space. Updated when this page is shown
+       via a one-shot statvfs call, no polling timer. */
+    lv_obj_t *info = lv_label_create(cont);
+    lv_obj_set_style_text_font(info, i18n_font(), 0);
+    lv_obj_set_style_text_color(info, lv_color_white(), 0);
+    uint64_t total = 0, free = 0;
+    if (esp_vfs_fat_info("/sdcard", &total, &free) == ESP_OK && total > 0) {
+        lv_label_set_text_fmt(info, "SD: %llu MB free of %llu MB",
+                              (unsigned long long)(free / (1024 * 1024)),
+                              (unsigned long long)(total / (1024 * 1024)));
+    } else {
+        lv_label_set_text(info, "SD: not mounted");
+    }
+
+    /* Clear button wipes every file under /sdcard/recordings without
+       reformatting the FS. The bsp doesn't expose a real
+       esp_vfs_fat_sdmmc_format entry point. */
+    lv_obj_t *clear_btn = lv_btn_create(cont);
+    lv_obj_set_size(clear_btn, 200, 32);
+    lv_obj_set_style_bg_color(clear_btn, lv_color_make(0xa0, 0x20, 0x20), 0);
+    lv_obj_t *bl = lv_label_create(clear_btn);
+    lv_label_set_text(bl, "Clear all recordings");
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(bl, i18n_font(), 0);
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(clear_btn, sd_clear_cb, LV_EVENT_CLICKED, NULL);
+    return page;
+}
+
 /* Wi-Fi sub-page is built earlier; add the auto-connect toggle there. */
 static void wifi_subpage_add_autoconnect(lv_obj_t *page)
 {
@@ -2777,6 +2861,7 @@ static void build_settings_tile(lv_obj_t *parent)
     lv_obj_t *p_snd   = build_subpage_sound(menu);
     lv_obj_t *p_lang  = build_subpage_language(menu);
     lv_obj_t *p_reset = build_subpage_reset(menu);
+    lv_obj_t *p_storage = build_subpage_storage(menu);
 
     /* Main (root) page: list of menu items. Scrolls vertically if
        there are more entries than fit on the 172 px tall canvas. */
@@ -2790,6 +2875,7 @@ static void build_settings_tile(lv_obj_t *parent)
         { LV_SYMBOL_AUDIO,    I18N_SET_SOUND,      p_snd   },
         { LV_SYMBOL_EYE_OPEN, I18N_SET_BRIGHTNESS, p_bri   },
         { LV_SYMBOL_POWER,    I18N_SET_AUTODIM,    p_dim   },
+        { LV_SYMBOL_SD_CARD,  I18N_SET_STORAGE,    p_storage },
         { LV_SYMBOL_TRASH,    I18N_SET_RESET,      p_reset },
         { LV_SYMBOL_KEYBOARD, I18N_SET_LANGUAGE,   p_lang  },
     };
@@ -2809,6 +2895,202 @@ static void build_settings_tile(lv_obj_t *parent)
     lv_menu_set_page(menu, main_page);
 }
 
+/* ---------------------- Recorder tile ---------------------- */
+
+static lv_obj_t *g_rec_status   = NULL;
+static lv_obj_t *g_rec_btn_lbl  = NULL;
+static lv_obj_t *g_rec_list     = NULL;
+static lv_obj_t *g_rec_sd_lbl   = NULL;   /* "SD: 12.4/30.0 GB" */
+static lv_timer_t *g_rec_poll   = NULL;
+
+static void recorder_refresh_list(void);
+
+static void rec_play_cb(lv_event_t *e)
+{
+    if (menu_input_blocked()) return;
+    const char *name = (const char *)lv_event_get_user_data(e);
+    char path[128];
+    snprintf(path, sizeof(path), "file://sdcard/recordings/%s", name);
+    /* Stop the radio if it's playing, then hand the URI to the same
+       engine. simple_player decodes .wav natively. */
+    if (radio_is_playing()) radio_stop();
+    radio_play(path);
+}
+
+static void rec_delete_cb(lv_event_t *e)
+{
+    if (menu_input_blocked()) return;
+    const char *name = (const char *)lv_event_get_user_data(e);
+    recorder_delete(name);
+    recorder_refresh_list();
+}
+
+static void recorder_refresh_list(void)
+{
+    if (!g_rec_list) return;
+    lv_obj_clean(g_rec_list);
+    static char names[16][64];
+    int n = recorder_list(names, 16);
+    if (n == 0) {
+        lv_obj_t *l = lv_label_create(g_rec_list);
+        lv_label_set_text(l, "(no recordings)");
+        lv_obj_set_style_text_color(l, lv_color_make(0xa0, 0xa0, 0xa0), 0);
+        lv_obj_set_style_text_font(l, i18n_font(), 0);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        lv_obj_t *row = lv_obj_create(g_rec_list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, lv_pct(100), 24);
+        lv_obj_set_layout(row, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *play = lv_btn_create(row);
+        lv_obj_set_size(play, 28, 22);
+        lv_obj_set_style_bg_color(play, lv_color_make(0x20, 0x80, 0x40), 0);
+        lv_obj_t *pl = lv_label_create(play);
+        lv_label_set_text(pl, LV_SYMBOL_PLAY);
+        lv_obj_set_style_text_color(pl, lv_color_white(), 0);
+        lv_obj_center(pl);
+        lv_obj_add_event_cb(play, rec_play_cb, LV_EVENT_CLICKED,
+                            (void *)names[i]);
+
+        lv_obj_t *name = lv_label_create(row);
+        lv_label_set_text(name, names[i]);
+        lv_obj_set_style_text_color(name, lv_color_white(), 0);
+        lv_obj_set_style_text_font(name, i18n_font(), 0);
+        lv_obj_set_flex_grow(name, 1);
+
+        lv_obj_t *del = lv_btn_create(row);
+        lv_obj_set_size(del, 28, 22);
+        lv_obj_set_style_bg_color(del, lv_color_make(0x80, 0x40, 0x20), 0);
+        lv_obj_t *dl = lv_label_create(del);
+        lv_label_set_text(dl, LV_SYMBOL_TRASH);
+        lv_obj_set_style_text_color(dl, lv_color_white(), 0);
+        lv_obj_center(dl);
+        lv_obj_add_event_cb(del, rec_delete_cb, LV_EVENT_CLICKED,
+                            (void *)names[i]);
+    }
+}
+
+static void rec_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "rec_btn: clicked, blocked=%d recording=%d",
+             (int)menu_input_blocked(), (int)recorder_is_recording());
+    if (menu_input_blocked()) return;
+    if (recorder_is_recording()) {
+        esp_err_t r = recorder_stop();
+        ESP_LOGI(TAG, "rec_btn: stop -> %s", esp_err_to_name(r));
+        recorder_refresh_list();
+    } else {
+        const char *path = NULL;
+        esp_err_t r = recorder_start(&path);
+        ESP_LOGI(TAG, "rec_btn: start -> %s path=%s",
+                 esp_err_to_name(r), path ? path : "(null)");
+    }
+}
+
+static void rec_poll_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (g_rec_btn_lbl) {
+        lv_label_set_text(g_rec_btn_lbl,
+            recorder_is_recording() ? LV_SYMBOL_STOP : "REC");
+    }
+    if (g_rec_status) {
+        if (recorder_is_recording()) {
+            lv_label_set_text_fmt(g_rec_status, "Recording  %us",
+                                  recorder_elapsed_s());
+        } else {
+            lv_label_set_text(g_rec_status, "Idle");
+        }
+    }
+    /* Refresh SD info ~once per second alongside the status. */
+    if (g_rec_sd_lbl) {
+        uint64_t total = 0, free = 0;
+        if (esp_vfs_fat_info("/sdcard", &total, &free) == ESP_OK && total > 0) {
+            uint64_t total_mb = total / (1024 * 1024);
+            uint64_t free_mb  = free  / (1024 * 1024);
+            lv_label_set_text_fmt(g_rec_sd_lbl, "SD %llu/%llu MB",
+                                  (unsigned long long)free_mb,
+                                  (unsigned long long)total_mb);
+        } else {
+            lv_label_set_text(g_rec_sd_lbl, "SD: not present");
+        }
+    }
+}
+
+static void build_recorder_tile(lv_obj_t *parent)
+{
+    lv_obj_set_style_bg_color(parent, lv_color_make(0x10, 0x10, 0x18), 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(parent, 0, 0);
+
+    /* Left column: list of recordings (60% width). */
+    g_rec_list = lv_obj_create(parent);
+    lv_obj_remove_style_all(g_rec_list);
+    lv_obj_set_size(g_rec_list, lv_pct(60), lv_pct(100));
+    lv_obj_align(g_rec_list, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_layout(g_rec_list, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(g_rec_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_rec_list, 2, 0);
+    lv_obj_set_style_pad_all(g_rec_list, 4, 0);
+    lv_obj_set_style_bg_color(g_rec_list, lv_color_make(0x10, 0x10, 0x18), 0);
+    lv_obj_set_style_bg_opa(g_rec_list, LV_OPA_COVER, 0);
+    lv_obj_set_scroll_dir(g_rec_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(g_rec_list, LV_SCROLLBAR_MODE_AUTO);
+    recorder_refresh_list();
+
+    /* Right column: status + record button. */
+    lv_obj_t *side = lv_obj_create(parent);
+    lv_obj_remove_style_all(side);
+    lv_obj_set_size(side, lv_pct(38), lv_pct(100));
+    lv_obj_align(side, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(side, lv_color_make(0x18, 0x18, 0x24), 0);
+    lv_obj_set_style_bg_opa(side, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(side, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(side, 6, 0);
+
+    lv_obj_t *header = lv_label_create(side);
+    lv_label_set_text(header, LV_SYMBOL_AUDIO "  Recorder");
+    lv_obj_set_style_text_color(header, lv_color_make(0xa0, 0xa0, 0xc0), 0);
+    lv_obj_set_style_text_font(header, i18n_font(), 0);
+    lv_obj_align(header, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    g_rec_status = lv_label_create(side);
+    lv_label_set_text(g_rec_status, "Idle");
+    lv_obj_set_style_text_color(g_rec_status, lv_color_white(), 0);
+    lv_obj_set_style_text_font(g_rec_status, i18n_font(), 0);
+    lv_obj_align(g_rec_status, LV_ALIGN_LEFT_MID, 0, -10);
+
+    g_rec_sd_lbl = lv_label_create(side);
+    lv_label_set_text(g_rec_sd_lbl, "SD ?/?");
+    lv_obj_set_style_text_color(g_rec_sd_lbl, lv_color_make(0xa0, 0xa0, 0xa0), 0);
+    lv_obj_set_style_text_font(g_rec_sd_lbl, i18n_font(), 0);
+    lv_obj_align(g_rec_sd_lbl, LV_ALIGN_LEFT_MID, 0, 12);
+
+    lv_obj_t *btn = lv_btn_create(side);
+    lv_obj_set_size(btn, 70, 50);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_RIGHT, 0, -4);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_make(0xc0, 0x30, 0x30), 0);
+    lv_obj_add_event_cb(btn, rec_btn_cb, LV_EVENT_CLICKED, NULL);
+    g_rec_btn_lbl = lv_label_create(btn);
+    lv_label_set_text(g_rec_btn_lbl, "REC");
+    lv_obj_set_style_text_color(g_rec_btn_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(g_rec_btn_lbl, i18n_font(), 0);
+    lv_obj_center(g_rec_btn_lbl);
+
+    if (!g_rec_poll) {
+        g_rec_poll = lv_timer_create(rec_poll_cb, 500, NULL);
+    }
+}
+
 /* ---------------------- Top-level UI builder ---------------------- */
 
 static void build_main_ui(const char *status_text)
@@ -2825,17 +3107,19 @@ static void build_main_ui(const char *status_text)
     lv_obj_set_style_bg_opa(g_tileview, LV_OPA_COVER, 0);
     lv_obj_set_scrollbar_mode(g_tileview, LV_SCROLLBAR_MODE_OFF);
 
-    /* 3-tile loop: Clock <-> Settings <-> Radio <-> Clock.
+    /* 4-tile loop: Clock <-> Settings <-> Radio <-> Recorder <-> Clock.
        LVGL tileview doesn't natively wrap; the wrap-around between tile 0
-       and tile 2 is handled by the gesture cb installed below. */
-    lv_obj_t *t_clock = lv_tileview_add_tile(g_tileview, 0, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    lv_obj_t *t_set   = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
-    lv_obj_t *t_radio = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+       and tile 3 is handled by the gesture cb installed below. */
+    lv_obj_t *t_clock  = lv_tileview_add_tile(g_tileview, 0, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    lv_obj_t *t_set    = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    lv_obj_t *t_radio  = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+    lv_obj_t *t_record = lv_tileview_add_tile(g_tileview, 3, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
     (void)status_text;
 
     build_clock_tile(t_clock);
     build_settings_tile(t_set);
     build_radio_tile(t_radio);
+    build_recorder_tile(t_record);
 
     /* Wrap-around: when the user swipes left on tile 0 or right on tile 2,
        LVGL's tileview just snaps back. Catch the indev gesture on the
@@ -2849,10 +3133,10 @@ static void build_main_ui(const char *status_text)
         lv_coord_t x = lv_obj_get_scroll_x(tv);
         lv_coord_t w = lv_obj_get_width(tv);
         int idx = (w > 0) ? (x + w / 2) / w : 0;
-        if (dir == LV_DIR_LEFT && idx == 2) {
+        if (dir == LV_DIR_LEFT && idx == 3) {
             lv_obj_set_tile_id(tv, 0, 0, LV_ANIM_OFF);
         } else if (dir == LV_DIR_RIGHT && idx == 0) {
-            lv_obj_set_tile_id(tv, 2, 0, LV_ANIM_OFF);
+            lv_obj_set_tile_id(tv, 3, 0, LV_ANIM_OFF);
         }
     }, LV_EVENT_GESTURE, NULL);
 

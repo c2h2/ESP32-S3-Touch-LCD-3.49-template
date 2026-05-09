@@ -25,6 +25,7 @@ TRANSLATIONS = [
     ("set_brightness",    "Brightness",        "亮度",               "明るさ",             "밝기"),
     ("set_autodim",       "Auto-dim",          "自动调暗",           "自動減光",           "자동 어두움"),
     ("set_reset",         "Reset",             "重置",               "リセット",           "초기화"),
+    ("set_storage",       "Storage",           "存储",               "ストレージ",         "저장소"),
     ("set_language",      "Language",          "语言",               "言語",               "언어"),
 
     # Common

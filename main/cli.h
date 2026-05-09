@@ -18,6 +18,13 @@ void app_wifi_connect_save(const char *ssid, const char *pass);
 int  app_cfg_get_lang(void);
 void app_cfg_set_lang(int lang);
 
+/* Set backlight 0..255 (255 = full). Also kicks the activity timer so
+   any pending dim/off transitions reset. Persists to cfg. */
+void app_cfg_set_brightness(int v);
+
+/* Set dim_s / off_s in seconds (0 = never). Persists. */
+void app_cfg_set_dim_off(int dim_s, int off_s);
+
 #ifdef __cplusplus
 }
 #endif
