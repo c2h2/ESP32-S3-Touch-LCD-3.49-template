@@ -99,6 +99,25 @@ static struct {
     struct arg_end *end;
 } s_wifi_connect_args;
 
+static struct {
+    struct arg_int *idx;
+    struct arg_end *end;
+} s_lang_args;
+
+static int cmd_lang(int argc, char **argv)
+{
+    if (argc == 1) {
+        printf("lang = %d\n", app_cfg_get_lang());
+        return 0;
+    }
+    int n = arg_parse(argc, argv, (void **)&s_lang_args);
+    if (n != 0) { arg_print_errors(stderr, s_lang_args.end, "lang"); return 1; }
+    int idx = s_lang_args.idx->ival[0];
+    app_cfg_set_lang(idx);
+    printf("lang -> %d (reboot or re-enter menu to refresh labels)\n", idx);
+    return 0;
+}
+
 static int cmd_wifi_connect(int argc, char **argv)
 {
     int n = arg_parse(argc, argv, (void **)&s_wifi_connect_args);
@@ -220,6 +239,18 @@ void cli_start(void)
         .argtable = &s_wifi_connect_args,
     };
     esp_console_cmd_register(&wcc);
+
+    /* lang [idx]: get/set active language (0=en, 1=zh, 2=ja, 3=ko). */
+    s_lang_args.idx = arg_int1(NULL, NULL, "<idx>", "0=en 1=zh 2=ja 3=ko");
+    s_lang_args.end = arg_end(2);
+    const esp_console_cmd_t lc = {
+        .command  = "lang",
+        .help     = "show or set UI language (0=en 1=zh 2=ja 3=ko)",
+        .hint     = NULL,
+        .func     = &cmd_lang,
+        .argtable = &s_lang_args,
+    };
+    esp_console_cmd_register(&lc);
 
     if (esp_console_start_repl(repl) != ESP_OK) {
         ESP_LOGE(TAG, "console start failed");

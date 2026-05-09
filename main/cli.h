@@ -12,6 +12,12 @@ void cli_start(void);
    private statics in main. */
 void app_wifi_connect_save(const char *ssid, const char *pass);
 
+/* Public language getter/setter (also used by i18n.c). Lang index is
+   0=en, 1=zh, 2=ja, 3=ko -- see scripts/translations.py. Setter persists
+   via cfg_save() but does not re-render existing labels. */
+int  app_cfg_get_lang(void);
+void app_cfg_set_lang(int lang);
+
 #ifdef __cplusplus
 }
 #endif

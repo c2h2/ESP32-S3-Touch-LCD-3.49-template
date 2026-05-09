@@ -40,6 +40,7 @@
 #include "audio_min.h"
 #include "radio.h"
 #include "cli.h"
+#include "i18n.h"
 #include "landmask.h"
 #include "tz_cities.h"
 
@@ -89,6 +90,7 @@ typedef struct {
     uint8_t  theme;         /* 0=dark, 1=light, 2=high-contrast */
     uint8_t  show_fps;      /* 1 = show FPS pill */
     uint8_t  wifi_autoconnect; /* 1 = auto-connect on boot */
+    uint8_t  lang;             /* 0=en, 1=zh, 2=ja, 3=ko */
 } app_cfg_t;
 
 static app_cfg_t g_cfg = {
@@ -106,6 +108,7 @@ static app_cfg_t g_cfg = {
     .theme      = 0,
     .show_fps   = 1,
     .wifi_autoconnect = 1,
+    .lang             = 0,
 };
 
 static void cfg_load(void);
@@ -124,6 +127,7 @@ typedef struct {
 
 static wifi_scan_ap_t g_wifi_scan[WIFI_MAX_SCAN_AP];
 static uint16_t       g_wifi_scan_n = 0;
+static bool           g_wifi_scanning = false;
 static bool           g_wifi_inited = false;
 static bool           g_wifi_connected = false;
 static char           g_wifi_curr_ssid[33] = {0};
@@ -168,6 +172,7 @@ static lv_timer_t *g_sunmap_timer    = NULL;
 /* Settings tile widgets (rebuilt on rotate). */
 static lv_obj_t  *g_set_wifi_status = NULL;
 static lv_obj_t  *g_set_wifi_list   = NULL;
+static int        g_set_wifi_sel    = -1;  /* index into g_wifi_scan or -1 */
 static lv_obj_t  *g_set_kb_overlay  = NULL;
 static lv_obj_t  *g_set_kb_ta       = NULL;
 static char       g_set_kb_ssid[33] = {0};
@@ -647,7 +652,7 @@ static void rotate_btn_event_cb(lv_event_t *e)
 
 /* Bump when defaults change so existing devices pick up the new
    values on the next flash instead of keeping stale NVS data. */
-#define CFG_VERSION  5u
+#define CFG_VERSION  6u
 
 /* Optional compiled-in default Wi-Fi credential. The committed source
    defines empty defaults; if main/wifi_secret.h exists locally
@@ -683,6 +688,7 @@ static void cfg_load(void)
     uint8_t  th  = g_cfg.theme;
     uint8_t  sf  = g_cfg.show_fps;
     uint8_t  wac = g_cfg.wifi_autoconnect;
+    uint8_t  lang= g_cfg.lang;
     size_t   sl  = sizeof(g_cfg.last_ssid);
     nvs_get_u8 (h, "ver",       &ver);
     if (nvs_get_u16(h, "tz_idx", &tzi) != ESP_OK) {
@@ -700,6 +706,7 @@ static void cfg_load(void)
     nvs_get_u8 (h, "theme",     &th);
     nvs_get_u8 (h, "show_fps",  &sf);
     nvs_get_u8 (h, "wifi_ac",   &wac);
+    nvs_get_u8 (h, "lang",      &lang);
     nvs_get_str(h, "last_ssid", g_cfg.last_ssid, &sl);
     nvs_close(h);
     if (tzi >= TZ_CITY_COUNT) tzi = TZ_DEFAULT_CITY_INDEX;
@@ -736,6 +743,7 @@ static void cfg_load(void)
     g_cfg.theme      = th;
     g_cfg.show_fps   = sf ? 1 : 0;
     g_cfg.wifi_autoconnect = wac ? 1 : 0;
+    g_cfg.lang = lang;
 }
 
 static void cfg_save(void)
@@ -754,6 +762,7 @@ static void cfg_save(void)
     nvs_set_u8 (h, "theme",     g_cfg.theme);
     nvs_set_u8 (h, "show_fps",  g_cfg.show_fps);
     nvs_set_u8 (h, "wifi_ac",   g_cfg.wifi_autoconnect);
+    nvs_set_u8 (h, "lang",      g_cfg.lang);
     nvs_set_u16(h, "dim_s",     g_cfg.dim_s);
     nvs_set_u16(h, "off_s",     g_cfg.off_s);
     nvs_set_str(h, "last_ssid", g_cfg.last_ssid);
@@ -805,9 +814,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                 ESP_LOGW(TAG, "wifi: disconnected reason=%u",
                          (unsigned)g_wifi_last_reason);
                 g_wifi_connected = false;
-                /* Auto-reconnect with backoff: try once after 2 s if
-                   we have a target SSID configured. */
-                if (g_wifi_curr_ssid[0]) {
+                /* Auto-reconnect with backoff: try once if we have a target
+                   SSID configured AND we're not in the middle of a user-
+                   initiated scan (scan can't run if a connect is racing). */
+                if (g_wifi_curr_ssid[0] && !g_wifi_scanning) {
                     esp_wifi_connect();
                 }
                 break;
@@ -839,6 +849,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                     g_wifi_scan_n = 0;
                 }
                 ESP_LOGI(TAG, "wifi: scan done, n=%u", (unsigned)g_wifi_scan_n);
+                g_wifi_scanning = false;
+                /* If a connect target is configured, resume reconnect now
+                   that the scan has finished. */
+                if (g_wifi_curr_ssid[0] && !g_wifi_connected) {
+                    esp_wifi_connect();
+                }
                 break;
             }
             default: break;
@@ -874,11 +890,20 @@ static void wifi_init_once(void)
 static void wifi_start_scan(void)
 {
     wifi_init_once();
+    /* Disconnect any in-flight association first; the radio can't scan
+       while it's repeatedly retrying a failed connect (NO_AP_FOUND etc).
+       g_wifi_scanning suppresses the disconnect-handler's auto-reconnect
+       so we don't fight ourselves. */
+    g_wifi_scanning = true;
+    esp_wifi_disconnect();
     wifi_scan_config_t sc = {};
     sc.show_hidden = false;
     sc.scan_type   = WIFI_SCAN_TYPE_ACTIVE;
     esp_err_t er = esp_wifi_scan_start(&sc, false);
-    if (er != ESP_OK) ESP_LOGW(TAG, "wifi: scan_start=%s", esp_err_to_name(er));
+    if (er != ESP_OK) {
+        ESP_LOGW(TAG, "wifi: scan_start=%s", esp_err_to_name(er));
+        g_wifi_scanning = false;  /* failed to start; allow reconnects */
+    }
 }
 
 static void wifi_connect(const char *ssid, const char *pass)
@@ -905,6 +930,17 @@ static void wifi_connect(const char *ssid, const char *pass)
     ESP_LOGI(TAG, "wifi: connect %s pass_len=%u auth=%d -> %s",
              ssid, (unsigned)(pass ? strlen(pass) : 0),
              (int)wc.sta.threshold.authmode, esp_err_to_name(er));
+}
+
+/* Public language getters/setters used by i18n.c. Defined here because
+   g_cfg is otherwise file-static. */
+extern "C" int  app_cfg_get_lang(void) { return g_cfg.lang; }
+extern "C" void app_cfg_set_lang(int lang)
+{
+    if (lang < 0) lang = 0;
+    if (lang >= I18N_LANG_COUNT) lang = 0;
+    g_cfg.lang = (uint8_t)lang;
+    cfg_save();
 }
 
 /* Public helper for cli.c: persist creds and kick a connect attempt. */
@@ -1021,12 +1057,12 @@ static void status_timer_cb(lv_timer_t *t)
                                       g_wifi_curr_ssid);
             } else {
                 lv_label_set_text_fmt(g_set_wifi_status,
-                                      "Connecting to %s... (%us)",
+                                      tr(I18N_WIFI_CONNECTING_N),
                                       g_wifi_curr_ssid,
                                       (unsigned)(elapsed / 1000));
             }
         } else {
-            lv_label_set_text(g_set_wifi_status, "Not connected");
+            lv_label_set_text(g_set_wifi_status, tr(I18N_WIFI_NOT_CONN));
         }
     }
 }
@@ -1410,10 +1446,10 @@ static void radio_set_status(const char *s)
 static bool radio_engine_ensure_up(void)
 {
     if (g_radio_engine_up) return true;
-    radio_set_status("Engine init...");
+    radio_set_status(tr(I18N_RADIO_ENGINE_INIT));
     audio_min_shutdown();
     if (radio_init() != ESP_OK) {
-        radio_set_status("Engine init FAILED");
+        radio_set_status(tr(I18N_RADIO_ENGINE_FAIL));
         return false;
     }
     g_radio_engine_up = true;
@@ -1433,18 +1469,18 @@ static void radio_worker_task(void *arg)
             int idx = g_radio_pending_idx;
             if (!radio_engine_ensure_up()) continue;
             char buf[80];
-            snprintf(buf, sizeof(buf), "Connecting %s...", radio_station_name(idx));
+            snprintf(buf, sizeof(buf), tr(I18N_RADIO_CONNECTING), radio_station_name(idx));
             radio_set_status(buf);
             if (radio_play_index(idx) == ESP_OK) {
-                snprintf(buf, sizeof(buf), "Playing %s", radio_station_name(idx));
+                snprintf(buf, sizeof(buf), tr(I18N_RADIO_PLAYING), radio_station_name(idx));
                 radio_set_status(buf);
             } else {
-                radio_set_status("Play FAILED");
+                radio_set_status(tr(I18N_RADIO_PLAY_FAIL));
             }
         } else if (cmd == RADIO_CMD_STOP) {
             g_radio_cmd = RADIO_CMD_NONE;
             if (g_radio_engine_up) radio_stop();
-            radio_set_status("Stopped");
+            radio_set_status(tr(I18N_RADIO_STOPPED));
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -1498,7 +1534,7 @@ static void radio_vol_step(int delta)
     if (v < 0) v = 0;
     if (v > 100) v = 100;
     radio_set_volume(v);
-    if (g_radio_vol_lbl) lv_label_set_text_fmt(g_radio_vol_lbl, "Vol %d", v);
+    if (g_radio_vol_lbl) lv_label_set_text_fmt(g_radio_vol_lbl, tr(I18N_VOL_N), v);
 }
 
 static void radio_vol_dn_cb(lv_event_t *e) { (void)e; radio_vol_step(-5); }
@@ -1582,7 +1618,7 @@ static void build_radio_tile(lv_obj_t *parent)
     lv_obj_set_style_pad_all(info, 6, 0);
 
     lv_obj_t *header = lv_label_create(info);
-    lv_label_set_text(header, LV_SYMBOL_AUDIO "  Now Playing");
+    lv_label_set_text_fmt(header, LV_SYMBOL_AUDIO "  %s", tr(I18N_RADIO_NOW_PLAYING));
     lv_obj_set_style_text_color(header, lv_color_make(0xa0, 0xa0, 0xc0), 0);
     lv_obj_set_style_text_font(header, &lv_font_montserrat_12, 0);
     lv_obj_align(header, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -1590,7 +1626,7 @@ static void build_radio_tile(lv_obj_t *parent)
     g_radio_now_lbl = lv_label_create(info);
     lv_label_set_long_mode(g_radio_now_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(g_radio_now_lbl, INFO_W - 12);
-    lv_label_set_text(g_radio_now_lbl, "No station yet");
+    lv_label_set_text(g_radio_now_lbl, tr(I18N_RADIO_NO_STATION));
     lv_obj_set_style_text_color(g_radio_now_lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(g_radio_now_lbl, &lv_font_montserrat_14, 0);
     lv_obj_align(g_radio_now_lbl, LV_ALIGN_TOP_LEFT, 0, 18);
@@ -1598,7 +1634,7 @@ static void build_radio_tile(lv_obj_t *parent)
     g_radio_status_lbl = lv_label_create(info);
     lv_label_set_long_mode(g_radio_status_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(g_radio_status_lbl, INFO_W - 12);
-    lv_label_set_text(g_radio_status_lbl, "Idle");
+    lv_label_set_text(g_radio_status_lbl, tr(I18N_IDLE));
     lv_obj_set_style_text_color(g_radio_status_lbl, lv_color_make(0xc0, 0xc0, 0xc0), 0);
     lv_obj_set_style_text_font(g_radio_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_align(g_radio_status_lbl, LV_ALIGN_TOP_LEFT, 0, 70);
@@ -1617,7 +1653,7 @@ static void build_radio_tile(lv_obj_t *parent)
     lv_obj_center(vol_dn_l);
 
     g_radio_vol_lbl = lv_label_create(info);
-    lv_label_set_text_fmt(g_radio_vol_lbl, "Vol %d", radio_get_volume());
+    lv_label_set_text_fmt(g_radio_vol_lbl, tr(I18N_VOL_N), radio_get_volume());
     lv_obj_set_style_text_color(g_radio_vol_lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(g_radio_vol_lbl, &lv_font_montserrat_12, 0);
     lv_obj_align(g_radio_vol_lbl, LV_ALIGN_BOTTOM_LEFT, 36, -10);
@@ -1748,7 +1784,7 @@ static void kb_event_cb(lv_event_t *e)
         g_cfg.last_ssid[sizeof(g_cfg.last_ssid) - 1] = 0;
         cfg_save();
         wifi_connect(ssid, pass_copy);
-        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ssid);
+        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, tr(I18N_WIFI_CONNECTING), ssid);
         kb_close();
     } else if (code == LV_EVENT_CANCEL) {
         kb_close();
@@ -1839,7 +1875,7 @@ static void kb_open_for_ssid(const char *ssid)
     lv_textarea_set_one_line(g_set_kb_ta, true);
     lv_textarea_set_password_mode(g_set_kb_ta, true);
     char ph[64];
-    snprintf(ph, sizeof(ph), "Pass for %s", ssid);
+    snprintf(ph, sizeof(ph), tr(I18N_WIFI_PASS_FOR), ssid);
     lv_textarea_set_placeholder_text(g_set_kb_ta, ph);
     lv_obj_set_size(g_set_kb_ta, canvas_w - EYE_W, TA_H);
     lv_obj_align(g_set_kb_ta, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -1894,22 +1930,33 @@ static void kb_open_for_ssid(const char *ssid)
 
 static bool menu_input_blocked(void);
 
+/* Tap-to-select: tapping an AP row just highlights it. The right-side
+   Connect button uses g_set_wifi_sel to drive the actual association. */
 static void wifi_ap_clicked_cb(lv_event_t *e)
 {
     if (menu_input_blocked()) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= (int)g_wifi_scan_n) return;
+    g_set_wifi_sel = idx;
+    set_render_wifi_list();
+}
+
+/* Connect the currently selected AP. Open APs go straight; saved-password
+   APs reuse the stored password; unknown-password APs open the keyboard. */
+static void wifi_connect_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    if (menu_input_blocked()) return;
+    int idx = g_set_wifi_sel;
+    if (idx < 0 || idx >= (int)g_wifi_scan_n) return;
     const wifi_scan_ap_t *ap = &g_wifi_scan[idx];
-    /* If we have a saved password for this SSID, just connect. Else
-       open the keyboard overlay for password entry. Open networks
-       (auth=0) connect with empty password. */
     if (ap->auth == 0) {
         cfg_save_ssid_pass(ap->ssid, "");
         strncpy(g_cfg.last_ssid, ap->ssid, sizeof(g_cfg.last_ssid) - 1);
         g_cfg.last_ssid[sizeof(g_cfg.last_ssid) - 1] = 0;
         cfg_save();
         wifi_connect(ap->ssid, "");
-        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ap->ssid);
+        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, tr(I18N_WIFI_CONNECTING), ap->ssid);
         return;
     }
     char pass[65] = {0};
@@ -1918,10 +1965,38 @@ static void wifi_ap_clicked_cb(lv_event_t *e)
         g_cfg.last_ssid[sizeof(g_cfg.last_ssid) - 1] = 0;
         cfg_save();
         wifi_connect(ap->ssid, pass);
-        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, "Connecting to %s...", ap->ssid);
+        if (g_set_wifi_status) lv_label_set_text_fmt(g_set_wifi_status, tr(I18N_WIFI_CONNECTING), ap->ssid);
         return;
     }
     kb_open_for_ssid(ap->ssid);
+}
+
+/* Forget the selected AP's saved password and clear last_ssid if it
+   matches. Keeps the AP visible in the list. */
+static void wifi_forget_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    int idx = g_set_wifi_sel;
+    if (idx < 0 || idx >= (int)g_wifi_scan_n) return;
+    const wifi_scan_ap_t *ap = &g_wifi_scan[idx];
+    /* nvs_erase_key on the per-SSID record + the auto-connect ssid if
+       it points here. */
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_WIFI, NVS_READWRITE, &h) == ESP_OK) {
+        char key[16] = {0};
+        strncpy(key, ap->ssid, sizeof(key) - 1);
+        nvs_erase_key(h, key);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (strncmp(ap->ssid, g_cfg.last_ssid, sizeof(g_cfg.last_ssid)) == 0) {
+        g_cfg.last_ssid[0] = 0;
+        cfg_save();
+        esp_wifi_disconnect();
+        g_wifi_connected = false;
+    }
+    set_render_wifi_list();
+    if (g_set_wifi_status) lv_label_set_text(g_set_wifi_status, tr(I18N_WIFI_NOT_CONN));
 }
 
 static void set_render_wifi_list(void)
@@ -1930,7 +2005,7 @@ static void set_render_wifi_list(void)
     lv_obj_clean(g_set_wifi_list);
     if (g_wifi_scan_n == 0) {
         lv_obj_t *empty = lv_label_create(g_set_wifi_list);
-        lv_label_set_text(empty, "(no networks yet -- tap Scan)");
+        lv_label_set_text(empty, tr(I18N_WIFI_NO_APS));
         lv_obj_set_style_text_color(empty, lv_color_make(0xa0, 0xa0, 0xa0), 0);
         lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
         return;
@@ -1940,15 +2015,32 @@ static void set_render_wifi_list(void)
         lv_obj_t *btn = lv_btn_create(g_set_wifi_list);
         lv_obj_set_width(btn, lv_pct(100));
         lv_obj_set_height(btn, 22);
-        lv_obj_set_style_bg_color(btn, lv_color_make(0x20, 0x20, 0x30), 0);
+        bool is_connected = g_wifi_connected &&
+                            strncmp(ap->ssid, g_wifi_curr_ssid,
+                                    sizeof(g_wifi_curr_ssid)) == 0;
+        bool is_selected  = (i == g_set_wifi_sel);
+        char dummy_pass[2];
+        bool is_saved = cfg_get_ssid_pass(ap->ssid, dummy_pass, sizeof(dummy_pass));
+        lv_obj_set_style_bg_color(btn,
+            is_selected ? lv_color_make(0x40, 0x40, 0x60)
+                        : lv_color_make(0x20, 0x20, 0x30), 0);
         lv_obj_set_style_pad_all(btn, 2, 0);
         lv_obj_add_event_cb(btn, wifi_ap_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         lv_obj_t *l = lv_label_create(btn);
-        lv_label_set_text_fmt(l, "%s%s  (%d dBm)",
+        /* Prefix glyphs: ✓ if currently connected; otherwise * if we have
+           a saved password but aren't connected. Lock indicates encryption. */
+        const char *prefix = "";
+        if (is_connected)      prefix = LV_SYMBOL_OK " ";
+        else if (is_saved)     prefix = "* ";
+        lv_label_set_text_fmt(l, "%s%s%s  %ddB",
+                              prefix,
                               ap->auth == 0 ? "" : LV_SYMBOL_KEYBOARD " ",
                               ap->ssid[0] ? ap->ssid : "(hidden)",
                               ap->rssi);
-        lv_obj_set_style_text_color(l, lv_color_white(), 0);
+        lv_color_t col = lv_color_white();
+        if (is_connected) col = lv_color_make(0x40, 0xc0, 0x80);
+        else if (is_saved) col = lv_color_make(0xa0, 0xc0, 0xff);
+        lv_obj_set_style_text_color(l, col, 0);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
         lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
     }
@@ -1957,7 +2049,7 @@ static void set_render_wifi_list(void)
 static void scan_btn_cb(lv_event_t *e)
 {
     (void)e;
-    if (g_set_wifi_status) lv_label_set_text(g_set_wifi_status, "Scanning...");
+    if (g_set_wifi_status) lv_label_set_text(g_set_wifi_status, tr(I18N_WIFI_SCANNING));
     wifi_start_scan();
     /* Schedule a one-shot UI refresh ~3s later when scan_done has fired. */
     lv_timer_t *t = lv_timer_create([](lv_timer_t *tt) {
@@ -2045,7 +2137,7 @@ static void bri_slider_cb(lv_event_t *e)
 
 static void fmt_duration(char *buf, size_t buflen, uint32_t total_s)
 {
-    if (total_s == 0)              snprintf(buf, buflen, "Never");
+    if (total_s == 0)              snprintf(buf, buflen, "%s", tr(I18N_NEVER));
     else if (total_s < 60)         snprintf(buf, buflen, "%us", (unsigned)total_s);
     else if (total_s < 3600) {
         unsigned m = total_s / 60, s = total_s % 60;
@@ -2071,8 +2163,8 @@ static void dim_s_cb(lv_event_t *e)
     if (lbl) {
         char d[24];
         fmt_duration(d, sizeof(d), g_cfg.dim_s);
-        if (g_cfg.dim_s == 0) lv_label_set_text(lbl, "Dim: Never");
-        else                  lv_label_set_text_fmt(lbl, "Dim after %s", d);
+        if (g_cfg.dim_s == 0) lv_label_set_text(lbl, tr(I18N_DIM_NEVER));
+        else                  lv_label_set_text_fmt(lbl, tr(I18N_DIM_AFTER), d);
     }
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
 }
@@ -2143,7 +2235,7 @@ static void audio_vol_cb(lv_event_t *e)
     g_cfg.audio_volume = (uint8_t)v;
     audio_min_set_volume(g_cfg.audio_volume);
     lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
-    if (lbl) lv_label_set_text_fmt(lbl, "Volume %d%%", v);
+    if (lbl) lv_label_set_text_fmt(lbl, tr(I18N_VOLUME_PCT), (unsigned)v);
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
 }
 
@@ -2202,8 +2294,8 @@ static void off_s_cb(lv_event_t *e)
     if (lbl) {
         char d[24];
         fmt_duration(d, sizeof(d), g_cfg.off_s);
-        if (g_cfg.off_s == 0) lv_label_set_text(lbl, "Sleep: Never");
-        else                  lv_label_set_text_fmt(lbl, "Sleep after %s", d);
+        if (g_cfg.off_s == 0) lv_label_set_text(lbl, tr(I18N_SLEEP_NEVER));
+        else                  lv_label_set_text_fmt(lbl, tr(I18N_SLEEP_AFTER), d);
     }
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) cfg_save();
 }
@@ -2213,37 +2305,78 @@ static void off_s_cb(lv_event_t *e)
 
 static lv_obj_t *build_subpage_wifi(lv_obj_t *menu)
 {
-    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Wi-Fi");
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_WIFI));
 
+    /* Outer cont laid out as a flex row: left column = AP list, right
+       column = status + Scan / Connect / Forget / auto-connect. */
     lv_obj_t *cont = lv_menu_cont_create(page);
     lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(cont, 4, 0);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(cont, 4, 0);
+    lv_obj_set_style_pad_all(cont, 2, 0);
+    lv_obj_set_height(cont, lv_pct(100));
 
-    g_set_wifi_status = lv_label_create(cont);
+    /* ---------- Left: AP list ---------- */
+    g_set_wifi_list = lv_obj_create(cont);
+    lv_obj_set_width(g_set_wifi_list, lv_pct(60));
+    lv_obj_set_height(g_set_wifi_list, lv_pct(100));
+    lv_obj_set_layout(g_set_wifi_list, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(g_set_wifi_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_set_wifi_list, 2, 0);
+    lv_obj_set_style_pad_all(g_set_wifi_list, 2, 0);
+    lv_obj_set_style_bg_color(g_set_wifi_list, lv_color_make(0x10, 0x10, 0x14), 0);
+    lv_obj_set_scroll_dir(g_set_wifi_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(g_set_wifi_list, LV_SCROLLBAR_MODE_AUTO);
+    set_render_wifi_list();
+
+    /* ---------- Right: actions + status ---------- */
+    lv_obj_t *side = lv_obj_create(cont);
+    lv_obj_remove_style_all(side);
+    lv_obj_set_width(side, lv_pct(38));
+    lv_obj_set_height(side, lv_pct(100));
+    lv_obj_set_layout(side, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(side, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(side, 4, 0);
+    lv_obj_clear_flag(side, LV_OBJ_FLAG_SCROLLABLE);
+
+    g_set_wifi_status = lv_label_create(side);
+    lv_label_set_long_mode(g_set_wifi_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(g_set_wifi_status, lv_pct(100));
     lv_label_set_text_fmt(g_set_wifi_status, "%s",
-                          g_wifi_connected ? g_wifi_curr_ssid : "Not connected");
+                          g_wifi_connected ? g_wifi_curr_ssid : tr(I18N_WIFI_NOT_CONN));
     lv_obj_set_style_text_color(g_set_wifi_status, lv_color_make(0xc0, 0xc0, 0xc0), 0);
     lv_obj_set_style_text_font(g_set_wifi_status, &lv_font_montserrat_12, 0);
 
-    lv_obj_t *scan_btn = lv_btn_create(cont);
-    lv_obj_set_height(scan_btn, 26);
-    lv_obj_set_width(scan_btn, 110);
+    /* Scan button */
+    lv_obj_t *scan_btn = lv_btn_create(side);
+    lv_obj_set_size(scan_btn, lv_pct(100), 24);
     lv_obj_t *scan_l = lv_label_create(scan_btn);
-    lv_label_set_text(scan_l, "Scan networks");
+    lv_label_set_text(scan_l, tr(I18N_WIFI_SCAN_BTN));
     lv_obj_set_style_text_font(scan_l, &lv_font_montserrat_12, 0);
     lv_obj_center(scan_l);
     lv_obj_add_event_cb(scan_btn, scan_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    g_set_wifi_list = lv_obj_create(cont);
-    lv_obj_set_width(g_set_wifi_list, lv_pct(100));
-    lv_obj_set_height(g_set_wifi_list, 100);
-    lv_obj_set_layout(g_set_wifi_list, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(g_set_wifi_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(g_set_wifi_list, 2, 0);
-    lv_obj_set_style_bg_color(g_set_wifi_list, lv_color_make(0x10, 0x10, 0x14), 0);
-    lv_obj_set_scroll_dir(g_set_wifi_list, LV_DIR_VER);
-    set_render_wifi_list();
+    /* Connect button (acts on selected list row) */
+    lv_obj_t *conn_btn = lv_btn_create(side);
+    lv_obj_set_size(conn_btn, lv_pct(100), 24);
+    lv_obj_set_style_bg_color(conn_btn, lv_color_make(0x20, 0x80, 0x40), 0);
+    lv_obj_t *conn_l = lv_label_create(conn_btn);
+    lv_label_set_text(conn_l, tr(I18N_WIFI_CONNECT_BTN));
+    lv_obj_set_style_text_color(conn_l, lv_color_white(), 0);
+    lv_obj_set_style_text_font(conn_l, &lv_font_montserrat_12, 0);
+    lv_obj_center(conn_l);
+    lv_obj_add_event_cb(conn_btn, wifi_connect_selected_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Forget button */
+    lv_obj_t *forget_btn = lv_btn_create(side);
+    lv_obj_set_size(forget_btn, lv_pct(100), 24);
+    lv_obj_set_style_bg_color(forget_btn, lv_color_make(0x80, 0x40, 0x20), 0);
+    lv_obj_t *forget_l = lv_label_create(forget_btn);
+    lv_label_set_text(forget_l, tr(I18N_WIFI_FORGET_BTN));
+    lv_obj_set_style_text_color(forget_l, lv_color_white(), 0);
+    lv_obj_set_style_text_font(forget_l, &lv_font_montserrat_12, 0);
+    lv_obj_center(forget_l);
+    lv_obj_add_event_cb(forget_btn, wifi_forget_selected_cb, LV_EVENT_CLICKED, NULL);
 
     return page;
 }
@@ -2274,7 +2407,7 @@ static lv_obj_t *build_subpage_tz(lv_obj_t *menu)
     /* Build the per-continent city pages first, then a continent-list
        root page that links to them. Two-level navigation matches the
        OpenWRT-style "Continent / City" picker. */
-    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Time zone");
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_TZ));
     lv_obj_set_scroll_dir(page, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_AUTO);
     for (uint16_t c = 0; c < TZ_CONTINENT_COUNT; c++) {
@@ -2292,14 +2425,14 @@ static lv_obj_t *build_subpage_tz(lv_obj_t *menu)
 
 static lv_obj_t *build_subpage_brightness(lv_obj_t *menu)
 {
-    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Brightness");
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_BRIGHTNESS));
     lv_obj_t *cont = lv_menu_cont_create(page);
     lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(cont, 6, 0);
 
     lv_obj_t *l = lv_label_create(cont);
-    lv_label_set_text(l, "Backlight level");
+    lv_label_set_text(l, tr(I18N_BACKLIGHT_LEVEL));
     lv_obj_set_style_text_color(l, lv_color_white(), 0);
     lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
 
@@ -2316,7 +2449,7 @@ static lv_obj_t *build_subpage_brightness(lv_obj_t *menu)
 
 static lv_obj_t *build_subpage_autodim(lv_obj_t *menu)
 {
-    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Auto-dim");
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_AUTODIM));
     lv_obj_t *cont = lv_menu_cont_create(page);
     lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
@@ -2326,8 +2459,8 @@ static lv_obj_t *build_subpage_autodim(lv_obj_t *menu)
     {
         char d[24];
         fmt_duration(d, sizeof(d), g_cfg.dim_s);
-        if (g_cfg.dim_s == 0) lv_label_set_text(dim_lbl, "Dim: Never");
-        else                  lv_label_set_text_fmt(dim_lbl, "Dim after %s", d);
+        if (g_cfg.dim_s == 0) lv_label_set_text(dim_lbl, tr(I18N_DIM_NEVER));
+        else                  lv_label_set_text_fmt(dim_lbl, tr(I18N_DIM_AFTER), d);
     }
     lv_obj_set_style_text_color(dim_lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(dim_lbl, &lv_font_montserrat_12, 0);
@@ -2345,8 +2478,8 @@ static lv_obj_t *build_subpage_autodim(lv_obj_t *menu)
     {
         char d[24];
         fmt_duration(d, sizeof(d), g_cfg.off_s);
-        if (g_cfg.off_s == 0) lv_label_set_text(off_lbl, "Sleep: Never");
-        else                  lv_label_set_text_fmt(off_lbl, "Sleep after %s", d);
+        if (g_cfg.off_s == 0) lv_label_set_text(off_lbl, tr(I18N_SLEEP_NEVER));
+        else                  lv_label_set_text_fmt(off_lbl, tr(I18N_SLEEP_AFTER), d);
     }
     lv_obj_set_style_text_color(off_lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(off_lbl, &lv_font_montserrat_12, 0);
@@ -2382,9 +2515,39 @@ static lv_obj_t *add_toggle_row(lv_obj_t *parent, const char *label,
     return row;
 }
 
+static void lang_pick_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    i18n_set_lang(idx);
+    /* No live re-render: the visible labels were built with the previous
+       language. Tell the user to re-enter the menu (or reboot). */
+}
+
+static lv_obj_t *build_subpage_language(lv_obj_t *menu)
+{
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_LANGUAGE));
+    lv_obj_set_scroll_dir(page, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_AUTO);
+    int cur = i18n_lang();
+    /* One row per supported language; tap to switch. */
+    for (int i = 0; i < I18N_LANG_COUNT; i++) {
+        lv_obj_t *cont = lv_menu_cont_create(page);
+        lv_obj_t *l    = lv_label_create(cont);
+        lv_label_set_text(l, k_i18n_lang_names[i]);
+        lv_obj_set_style_text_font(l, i18n_font(), 0);
+        if (i == cur) {
+            lv_obj_set_style_text_color(l, lv_color_make(0x40, 0xc0, 0x80), 0);
+        }
+        lv_obj_add_flag(cont, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(cont, lang_pick_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+    }
+    return page;
+}
+
 static lv_obj_t *build_subpage_display(lv_obj_t *menu)
 {
-    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Display");
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_DISPLAY));
     lv_obj_set_scroll_dir(page, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_t *cont = lv_menu_cont_create(page);
@@ -2392,13 +2555,13 @@ static lv_obj_t *build_subpage_display(lv_obj_t *menu)
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(cont, 6, 0);
 
-    add_toggle_row(cont, "24-hour clock", g_cfg.hour24,      hour_fmt_cb);
-    add_toggle_row(cont, "Show seconds",  g_cfg.show_seconds, show_sec_cb);
-    add_toggle_row(cont, "Show ms",       g_cfg.show_ms,      show_ms_cb);
-    add_toggle_row(cont, "Show FPS",      g_cfg.show_fps,     show_fps_cb);
+    add_toggle_row(cont, tr(I18N_HOUR_24), g_cfg.hour24, hour_fmt_cb);
+    add_toggle_row(cont, tr(I18N_SHOW_SECONDS), g_cfg.show_seconds, show_sec_cb);
+    add_toggle_row(cont, tr(I18N_SHOW_MS), g_cfg.show_ms, show_ms_cb);
+    add_toggle_row(cont, tr(I18N_SHOW_FPS), g_cfg.show_fps, show_fps_cb);
 
     lv_obj_t *df_l = lv_label_create(cont);
-    lv_label_set_text(df_l, "Date format");
+    lv_label_set_text(df_l, tr(I18N_DATE_FORMAT));
     lv_obj_set_style_text_font(df_l, &lv_font_montserrat_12, 0);
     lv_obj_t *df = lv_dropdown_create(cont);
     lv_dropdown_set_options_static(df,
@@ -2407,10 +2570,16 @@ static lv_obj_t *build_subpage_display(lv_obj_t *menu)
     lv_obj_add_event_cb(df, date_fmt_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     lv_obj_t *th_l = lv_label_create(cont);
-    lv_label_set_text(th_l, "Theme (menu reloads on next boot)");
+    lv_label_set_text(th_l, tr(I18N_THEME));
     lv_obj_set_style_text_font(th_l, &lv_font_montserrat_12, 0);
     lv_obj_t *th = lv_dropdown_create(cont);
-    lv_dropdown_set_options_static(th, "Dark\nLight\nHigh contrast");
+    /* Build a "Dark\nLight\nHigh contrast"-style options string in a static
+       buffer so the dropdown can keep using it. Refreshed on each entry to
+       this sub-page so it picks up the active language. */
+    static char theme_opts[96];
+    snprintf(theme_opts, sizeof(theme_opts), "%s\n%s\n%s",
+             tr(I18N_THEME_DARK), tr(I18N_THEME_LIGHT), tr(I18N_THEME_HICONTRAST));
+    lv_dropdown_set_options_static(th, theme_opts);
     lv_dropdown_set_selected(th, g_cfg.theme);
     lv_obj_add_event_cb(th, theme_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -2419,16 +2588,16 @@ static lv_obj_t *build_subpage_display(lv_obj_t *menu)
 
 static lv_obj_t *build_subpage_sound(lv_obj_t *menu)
 {
-    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Sound");
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_SOUND));
     lv_obj_t *cont = lv_menu_cont_create(page);
     lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(cont, 6, 0);
 
-    add_toggle_row(cont, "Sound enabled", g_cfg.audio_enable, audio_en_cb);
+    add_toggle_row(cont, tr(I18N_SOUND_ENABLED), g_cfg.audio_enable, audio_en_cb);
 
     lv_obj_t *vol_lbl = lv_label_create(cont);
-    lv_label_set_text_fmt(vol_lbl, "Volume %u%%", (unsigned)g_cfg.audio_volume);
+    lv_label_set_text_fmt(vol_lbl, tr(I18N_VOLUME_PCT), (unsigned)g_cfg.audio_volume);
     lv_obj_set_style_text_font(vol_lbl, &lv_font_montserrat_12, 0);
 
     lv_obj_t *vol_s = lv_slider_create(cont);
@@ -2444,14 +2613,14 @@ static lv_obj_t *build_subpage_sound(lv_obj_t *menu)
 
 static lv_obj_t *build_subpage_reset(lv_obj_t *menu)
 {
-    lv_obj_t *page = lv_menu_page_create(menu, (char *)"Reset");
+    lv_obj_t *page = lv_menu_page_create(menu, (char *)tr(I18N_SET_RESET));
     lv_obj_t *cont = lv_menu_cont_create(page);
     lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(cont, 6, 0);
 
     lv_obj_t *l = lv_label_create(cont);
-    lv_label_set_text(l, "Erase all settings + Wi-Fi creds, then reboot.");
+    lv_label_set_text(l, tr(I18N_RESET_WARN));
     lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(l, lv_pct(95));
@@ -2461,7 +2630,7 @@ static lv_obj_t *build_subpage_reset(lv_obj_t *menu)
     lv_obj_set_width(btn, 160);
     lv_obj_set_style_bg_color(btn, lv_color_make(0xa0, 0x20, 0x20), 0);
     lv_obj_t *bl = lv_label_create(btn);
-    lv_label_set_text(bl, "Erase + reboot");
+    lv_label_set_text(bl, tr(I18N_RESET_BTN));
     lv_obj_set_style_text_color(bl, lv_color_white(), 0);
     lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
     lv_obj_center(bl);
@@ -2473,9 +2642,12 @@ static lv_obj_t *build_subpage_reset(lv_obj_t *menu)
 /* Wi-Fi sub-page is built earlier; add the auto-connect toggle there. */
 static void wifi_subpage_add_autoconnect(lv_obj_t *page)
 {
-    lv_obj_t *cont = lv_obj_get_child(page, 0);
-    if (!cont) return;
-    add_toggle_row(cont, "Auto-connect on boot", g_cfg.wifi_autoconnect, wifi_ac_cb);
+    /* page contents: menu_cont -> [list, side]. Toggle goes inside side. */
+    lv_obj_t *menu_cont = lv_obj_get_child(page, 0);
+    if (!menu_cont || lv_obj_get_child_cnt(menu_cont) < 2) return;
+    lv_obj_t *side = lv_obj_get_child(menu_cont, 1);
+    if (!side) return;
+    add_toggle_row(side, tr(I18N_WIFI_AUTOCONNECT), g_cfg.wifi_autoconnect, wifi_ac_cb);
 }
 
 static void build_settings_tile(lv_obj_t *parent)
@@ -2493,7 +2665,10 @@ static void build_settings_tile(lv_obj_t *parent)
     lv_menu_set_mode_root_back_btn(menu, LV_MENU_ROOT_BACK_BTN_DISABLED);
     lv_obj_set_style_bg_color(menu, pal.menu_surf, 0);
     lv_obj_set_style_text_color(menu, pal.text, 0);
-    lv_obj_set_style_text_font(menu, &lv_font_montserrat_12, 0);
+    /* Use the i18n font (CJK glyphs at 14 px with Latin fallback) so labels
+       in zh/ja/ko render. Latin-only labels still pick the Montserrat
+       fallback, so this is safe even in en mode. */
+    lv_obj_set_style_text_font(menu, i18n_font(), 0);
 
     /* Header bar: title fills the middle, back button anchored right. */
     lv_obj_t *hdr = lv_menu_get_main_header(menu);
@@ -2531,7 +2706,7 @@ static void build_settings_tile(lv_obj_t *parent)
             lv_obj_add_flag(lv_obj_get_child(back, 0), LV_OBJ_FLAG_HIDDEN);
         }
         lv_obj_t *txt = lv_label_create(back);
-        lv_label_set_text(txt, LV_SYMBOL_LEFT " Back");
+        lv_label_set_text_fmt(txt, LV_SYMBOL_LEFT " %s", tr(I18N_BACK));
         lv_obj_set_style_text_color(txt, lv_color_white(), 0);
         lv_obj_set_style_text_font(txt, &lv_font_montserrat_14, 0);
         lv_obj_center(txt);
@@ -2545,27 +2720,29 @@ static void build_settings_tile(lv_obj_t *parent)
     lv_obj_t *p_dim   = build_subpage_autodim(menu);
     lv_obj_t *p_disp  = build_subpage_display(menu);
     lv_obj_t *p_snd   = build_subpage_sound(menu);
+    lv_obj_t *p_lang  = build_subpage_language(menu);
     lv_obj_t *p_reset = build_subpage_reset(menu);
 
     /* Main (root) page: list of menu items. Scrolls vertically if
        there are more entries than fit on the 172 px tall canvas. */
-    lv_obj_t *main_page = lv_menu_page_create(menu, (char *)"==== MENU ====");
+    lv_obj_t *main_page = lv_menu_page_create(menu, (char *)tr(I18N_MENU_TITLE));
     lv_obj_set_scroll_dir(main_page, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(main_page, LV_SCROLLBAR_MODE_AUTO);
-    struct { const char *icon_label; lv_obj_t *page; } rows[] = {
-        { LV_SYMBOL_WIFI     "  Wi-Fi",      p_wifi  },
-        { LV_SYMBOL_BELL     "  Time zone",  p_tz    },
-        { LV_SYMBOL_IMAGE    "  Display",    p_disp  },
-        { LV_SYMBOL_AUDIO    "  Sound",      p_snd   },
-        { LV_SYMBOL_EYE_OPEN "  Brightness", p_bri   },
-        { LV_SYMBOL_POWER    "  Auto-dim",   p_dim   },
-        { LV_SYMBOL_TRASH    "  Reset",      p_reset },
+    struct { const char *icon; i18n_key_t key; lv_obj_t *page; } rows[] = {
+        { LV_SYMBOL_WIFI,     I18N_SET_WIFI,       p_wifi  },
+        { LV_SYMBOL_BELL,     I18N_SET_TZ,         p_tz    },
+        { LV_SYMBOL_IMAGE,    I18N_SET_DISPLAY,    p_disp  },
+        { LV_SYMBOL_AUDIO,    I18N_SET_SOUND,      p_snd   },
+        { LV_SYMBOL_EYE_OPEN, I18N_SET_BRIGHTNESS, p_bri   },
+        { LV_SYMBOL_POWER,    I18N_SET_AUTODIM,    p_dim   },
+        { LV_SYMBOL_TRASH,    I18N_SET_RESET,      p_reset },
+        { LV_SYMBOL_KEYBOARD, I18N_SET_LANGUAGE,   p_lang  },
     };
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         lv_obj_t *cont = lv_menu_cont_create(main_page);
         lv_obj_t *l    = lv_label_create(cont);
-        lv_label_set_text(l, rows[i].icon_label);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_label_set_text_fmt(l, "%s  %s", rows[i].icon, tr(rows[i].key));
+        lv_obj_set_style_text_font(l, i18n_font(), 0);
         lv_menu_set_load_page_event(menu, cont, rows[i].page);
     }
 
