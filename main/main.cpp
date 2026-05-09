@@ -112,6 +112,7 @@ static app_cfg_t g_cfg = {
 };
 
 static void cfg_load(void);
+static bool menu_input_blocked(void);
 static void cfg_save(void);
 static void cfg_save_ssid_pass(const char *ssid, const char *pass);
 static bool cfg_get_ssid_pass(const char *ssid, char *pass, size_t pass_len);
@@ -394,6 +395,11 @@ static void fps_timer_cb(lv_timer_t *t)
 
 static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
+    /* Tiny dead-zone filter to suppress controller jitter while pressed.
+       Held across calls so a stationary finger reports a stable coord. */
+    static bool s_was_pressed = false;
+    static int  s_hold_x = 0, s_hold_y = 0;
+
     uint8_t cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0, 0, 0, 0x0e, 0, 0, 0};
     uint8_t buff[32] = {0};
     ESP_ERROR_CHECK_WITHOUT_ABORT(
@@ -425,10 +431,23 @@ static void lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
         if (cx >= CW) cx = CW - 1;
         if (cy < 0) cy = 0;
         if (cy >= CH) cy = CH - 1;
+        /* While pressed, snap samples within 2 px of the last reported
+           point back to that point. Kills the controller's 1-2 px jitter
+           so taps don't drift into scroll territory. */
+        const int DEAD = 2;
+        if (s_was_pressed && abs(cx - s_hold_x) <= DEAD && abs(cy - s_hold_y) <= DEAD) {
+            cx = s_hold_x;
+            cy = s_hold_y;
+        } else {
+            s_hold_x = cx;
+            s_hold_y = cy;
+        }
+        s_was_pressed = true;
         data->state = LV_INDEV_STATE_PR;
         data->point.x = cx;
         data->point.y = cy;
     } else {
+        s_was_pressed = false;
         data->state = LV_INDEV_STATE_REL;
     }
 }
@@ -572,12 +591,22 @@ static void lvgl_init(esp_lcd_panel_handle_t panel)
     lv_indev_drv_init(&indev_drv);
     indev_drv.type    = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = lvgl_touch_cb;
-    /* Touch is imprecise on the 172 px-tall canvas: a stationary tap can
-       drift several pixels before release. Lower scroll_limit so even a
-       small finger drag starts a scroll (which cancels the click), and
-       bump scroll_throw for a smoother fling. */
-    indev_drv.scroll_limit = 4;
-    indev_drv.scroll_throw = 20;
+    /* Touch tuning for iPhone/Android-feel:
+       - The 2-px dead-zone in lvgl_touch_cb already kills the
+         capacitive controller's stationary jitter, so a tap reports
+         a stable point.
+       - scroll_limit kept low (8 px) so a deliberate scroll cancels
+         the click quickly. LVGL automatically suppresses CLICK on
+         release when the press caused any scroll to start.
+       - gesture_limit raised so an accidental sideways drift on a
+         tap doesn't trigger the tileview swipe gesture.
+       - long_press_time slightly raised so a finger that stays pressed
+         a beat too long doesn't trigger auto-repeat. */
+    indev_drv.scroll_limit            = 8;
+    indev_drv.scroll_throw            = 25;
+    indev_drv.gesture_limit           = 60;
+    indev_drv.long_press_time         = 500;
+    indev_drv.long_press_repeat_time  = 100;
     lv_indev_drv_register(&indev_drv);
 
     lvgl_mux = xSemaphoreCreateMutex();
@@ -1556,6 +1585,7 @@ static void radio_play_btn_cb(lv_event_t *e)
 
 static void radio_station_pick_cb(lv_event_t *e)
 {
+    if (menu_input_blocked()) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= radio_station_count()) return;
     radio_worker_ensure();
@@ -1928,8 +1958,6 @@ static void kb_open_for_ssid(const char *ssid)
     lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_CANCEL, NULL);
 }
 
-static bool menu_input_blocked(void);
-
 /* Tap-to-select: tapping an AP row just highlights it. The right-side
    Connect button uses g_set_wifi_sel to drive the actual association. */
 static void wifi_ap_clicked_cb(lv_event_t *e)
@@ -2067,13 +2095,23 @@ static void scan_btn_cb(lv_event_t *e)
    slides in under the finger. Stamped by the back-button click handler
    below; tested by every action callback that mutates state. */
 static uint32_t g_menu_input_block_until_ms = 0;
+static uint32_t g_last_scroll_ms = 0;
 #define MENU_BACK_DEBOUNCE_MS  350
+#define SCROLL_CLICK_SUPPRESS_MS 250
 
 static bool menu_input_blocked(void)
 {
     uint32_t now = lv_tick_get();
-    /* lv_tick wraps at 2^32 ms; signed compare handles wrap gracefully. */
-    return (int32_t)(g_menu_input_block_until_ms - now) > 0;
+    /* Block if we're inside the back-press debounce window. */
+    if ((int32_t)(g_menu_input_block_until_ms - now) > 0) return true;
+    /* iOS/Android-style: also block if the last scroll motion was within
+       SCROLL_CLICK_SUPPRESS_MS. Stops a fling-then-release from firing a
+       click on the row the finger happened to lift on. */
+    if (g_last_scroll_ms != 0 &&
+        lv_tick_elaps(g_last_scroll_ms) < SCROLL_CLICK_SUPPRESS_MS) {
+        return true;
+    }
+    return false;
 }
 
 /* Transparent shield placed above the menu for MENU_BACK_DEBOUNCE_MS
@@ -2419,6 +2457,7 @@ static lv_obj_t *build_subpage_tz(lv_obj_t *menu)
         lv_label_set_text(l, k_tz_continents[c].name);
         lv_obj_set_style_text_font(l, i18n_font(), 0);
         lv_menu_set_load_page_event(menu, cont, city_page);
+        lv_obj_add_event_cb(cont, menu_back_clicked_cb, LV_EVENT_CLICKED, NULL);
     }
     return page;
 }
@@ -2517,10 +2556,26 @@ static lv_obj_t *add_toggle_row(lv_obj_t *parent, const char *label,
 
 static void lang_pick_cb(lv_event_t *e)
 {
+    if (menu_input_blocked()) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    ESP_LOGI(TAG, "lang_pick: %d", idx);
     i18n_set_lang(idx);
-    /* No live re-render: the visible labels were built with the previous
-       language. Tell the user to re-enter the menu (or reboot). */
+    /* Repaint every label in this language sub-page so the green tick
+       moves to the newly-selected language immediately. */
+    lv_obj_t *cont = lv_event_get_current_target(e);
+    /* Climb to the menu_page (event came from the row, parent is the page). */
+    lv_obj_t *page = cont ? lv_obj_get_parent(cont) : NULL;
+    if (page) {
+        for (uint32_t i = 0; i < lv_obj_get_child_cnt(page); i++) {
+            lv_obj_t *row = lv_obj_get_child(page, i);
+            if (!row || lv_obj_get_child_cnt(row) == 0) continue;
+            lv_obj_t *lbl = lv_obj_get_child(row, 0);
+            if (!lbl) continue;
+            lv_obj_set_style_text_color(lbl,
+                ((int)i == idx) ? lv_color_make(0x40, 0xc0, 0x80)
+                                : lv_color_white(), 0);
+        }
+    }
 }
 
 static lv_obj_t *build_subpage_language(lv_obj_t *menu)
@@ -2744,6 +2799,11 @@ static void build_settings_tile(lv_obj_t *parent)
         lv_label_set_text_fmt(l, "%s  %s", rows[i].icon, tr(rows[i].key));
         lv_obj_set_style_text_font(l, i18n_font(), 0);
         lv_menu_set_load_page_event(menu, cont, rows[i].page);
+        /* Same input-shield trick as the back button: stamp the debounce
+           when a row is clicked so the touch that loaded the new page
+           can't also fire a click on whatever item lands under the
+           finger on that new page. */
+        lv_obj_add_event_cb(cont, menu_back_clicked_cb, LV_EVENT_CLICKED, NULL);
     }
 
     lv_menu_set_page(menu, main_page);
@@ -2822,6 +2882,20 @@ static void build_main_ui(const char *status_text)
     /* Activity wake: any touch on the screen kicks the dim timer. */
     lv_obj_add_event_cb(scr, activity_kick, LV_EVENT_PRESSED,  NULL);
     lv_obj_add_event_cb(scr, activity_kick, LV_EVENT_RELEASED, NULL);
+
+    /* iOS/Android-style scroll-then-click suppression. Any scroll on any
+       descendant bubbles SCROLL_BEGIN / SCROLL / SCROLL_END up to the
+       screen. We stamp the time and consult it from menu_input_blocked()
+       and the action callbacks so a click that lands within 250 ms of a
+       scroll motion is ignored. */
+    lv_obj_add_event_cb(scr, [](lv_event_t *e) {
+        lv_event_code_t c = lv_event_get_code(e);
+        /* Only stamp on SCROLL (mid-motion) -- not BEGIN/END, which can
+           fire even on no-op presses and would suppress all clicks. */
+        if (c == LV_EVENT_SCROLL) {
+            g_last_scroll_ms = lv_tick_get();
+        }
+    }, LV_EVENT_ALL, NULL);
     g_last_activity_ms = lv_tick_get();
     if (!g_dim_timer) {
         g_dim_timer = lv_timer_create(dim_timer_cb, 1000, NULL);

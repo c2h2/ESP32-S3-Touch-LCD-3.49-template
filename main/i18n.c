@@ -30,6 +30,11 @@ static bool      s_i18n_font_ready = false;
 
 const lv_font_t *i18n_font(void)
 {
+    /* English: keep crisp Latin-only Montserrat 14 -- zero CJK lookup cost
+       and the original look. Only zh/ja/ko pay the 32k-glyph table walk. */
+    if (i18n_lang() == 0) {
+        return &lv_font_montserrat_14;
+    }
     if (!s_i18n_font_ready) {
         s_i18n_font = font_cjk_14;
         s_i18n_font.fallback = &lv_font_montserrat_14;
