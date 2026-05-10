@@ -3086,29 +3086,69 @@ static void rec_poll_cb(lv_timer_t *t)
         if (recorder_monitor_start() == ESP_OK) s_monitor_running = true;
     }
     bool recording = recorder_is_recording();
+    bool playing   = radio_is_playing();
     if (g_rec_btn_lbl) {
         lv_label_set_text(g_rec_btn_lbl, recording ? LV_SYMBOL_STOP : "REC");
     }
     if (g_rec_status) {
         if (recording) {
-            lv_label_set_text_fmt(g_rec_status, "Recording  %us",
+            lv_label_set_text_fmt(g_rec_status, LV_SYMBOL_AUDIO " REC  %us",
                                   recorder_elapsed_s());
+            lv_obj_set_style_text_color(g_rec_status, lv_color_make(0xff, 0x40, 0x40), 0);
+        } else if (playing) {
+            /* Show "▶ Playing <basename>" so the user can tell that
+               radio_play actually fired even if the speaker output
+               sounds quiet. The VU bars below also flip to the
+               decoder's output level so they reflect playback, not
+               the mic. */
+            const char *uri = radio_current_uri();
+            const char *base = uri ? uri : "stream";
+            const char *slash = NULL;
+            if (uri) {
+                for (const char *p = uri; *p; p++) if (*p == '/') slash = p;
+                if (slash) base = slash + 1;
+            }
+            lv_label_set_text_fmt(g_rec_status, LV_SYMBOL_PLAY " %s", base);
+            lv_obj_set_style_text_color(g_rec_status, lv_color_make(0x40, 0xc0, 0xff), 0);
         } else {
             lv_label_set_text(g_rec_status, "Idle");
+            lv_obj_set_style_text_color(g_rec_status, lv_color_white(), 0);
         }
     }
-    /* Stereo L/R VU. Monitor mode keeps the codec read loop alive
-       whether recording or not. Smooth with peak-attack / slow-decay. */
-    uint16_t pl = 0, pr = 0;
-    recorder_peak_lr(&pl, &pr);
+    /* Stereo L/R VU. Source flips between mic input and decoder
+       output: when playback is active, show the decoded PCM peak so
+       the user can confirm the player is actually emitting samples
+       (independent of speaker volume); otherwise show mic input from
+       the recorder's monitor loop. Always read both peak buffers so
+       neither accumulates stale residue across modes. */
+    uint16_t mic_l = 0, mic_r = 0;
+    uint16_t out_l = 0, out_r = 0;
+    recorder_peak_lr(&mic_l, &mic_r);
+    radio_out_peak(&out_l, &out_r);
+    uint16_t pl = playing ? out_l : mic_l;
+    uint16_t pr = playing ? out_r : mic_r;
     int tl = peak_to_pct(pl);
     int tr = peak_to_pct(pr);
     if (tl > g_rec_vu_l_smooth) g_rec_vu_l_smooth = tl;
     else g_rec_vu_l_smooth = (g_rec_vu_l_smooth * 7 + tl) / 8;
     if (tr > g_rec_vu_r_smooth) g_rec_vu_r_smooth = tr;
     else g_rec_vu_r_smooth = (g_rec_vu_r_smooth * 7 + tr) / 8;
-    if (g_rec_vu_l) lv_bar_set_value(g_rec_vu_l, g_rec_vu_l_smooth, LV_ANIM_OFF);
-    if (g_rec_vu_r) lv_bar_set_value(g_rec_vu_r, g_rec_vu_r_smooth, LV_ANIM_OFF);
+    /* Visual hint: tint the indicator blue while playback is active,
+       green during normal mic monitoring. */
+    if (g_rec_vu_l) {
+        lv_obj_set_style_bg_color(g_rec_vu_l,
+            playing ? lv_color_make(0x40, 0xa0, 0xff)
+                    : lv_color_make(0x30, 0xc0, 0x40),
+            LV_PART_INDICATOR);
+        lv_bar_set_value(g_rec_vu_l, g_rec_vu_l_smooth, LV_ANIM_OFF);
+    }
+    if (g_rec_vu_r) {
+        lv_obj_set_style_bg_color(g_rec_vu_r,
+            playing ? lv_color_make(0x40, 0xa0, 0xff)
+                    : lv_color_make(0x30, 0xc0, 0x40),
+            LV_PART_INDICATOR);
+        lv_bar_set_value(g_rec_vu_r, g_rec_vu_r_smooth, LV_ANIM_OFF);
+    }
 }
 
 static void rec_list_close_cb(lv_event_t *e)

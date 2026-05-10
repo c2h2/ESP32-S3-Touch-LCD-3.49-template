@@ -64,13 +64,50 @@ static int                     s_volume     = 70;  /* 0..100 */
 static uint32_t                s_cur_rate   = 0;
 static uint8_t                 s_cur_bits   = 0;
 static uint8_t                 s_cur_ch     = 0;
+/* Output VU: peak abs sample seen in the most recent decoded chunk.
+   Read-and-reset by radio_out_peak() so the UI can drive a playback
+   bar. Resets to 0 when nothing is being decoded. */
+static volatile uint16_t       s_out_peak_l = 0;
+static volatile uint16_t       s_out_peak_r = 0;
 
 static int radio_out_cb(uint8_t *data, int data_size, void *ctx)
 {
     (void)ctx;
     if (!s_play_dev || !data || data_size <= 0) return 0;
+    /* Peak-track the decoded PCM. simple_player feeds 16-bit PCM in
+       the codec's currently configured channel layout; both mono and
+       stereo work here since we treat it as a stream of int16_t. */
+    if (s_cur_bits == 16) {
+        const int16_t *p = (const int16_t *)data;
+        int n_samples = data_size / 2;
+        uint16_t pl = 0, pr = 0;
+        if (s_cur_ch == 2) {
+            int frames = n_samples / 2;
+            for (int i = 0; i < frames; i++) {
+                int l = p[2 * i];      if (l < 0) l = -l;
+                int r = p[2 * i + 1];  if (r < 0) r = -r;
+                if (l > pl) pl = (uint16_t)l;
+                if (r > pr) pr = (uint16_t)r;
+            }
+        } else {
+            for (int i = 0; i < n_samples; i++) {
+                int v = p[i]; if (v < 0) v = -v;
+                if (v > pl) pl = (uint16_t)v;
+            }
+            pr = pl;
+        }
+        if (pl > s_out_peak_l) s_out_peak_l = pl;
+        if (pr > s_out_peak_r) s_out_peak_r = pr;
+    }
     int err = esp_codec_dev_write(s_play_dev, data, data_size);
     return err == ESP_CODEC_DEV_OK ? data_size : 0;
+}
+
+void radio_out_peak(uint16_t *out_l, uint16_t *out_r)
+{
+    if (out_l) *out_l = s_out_peak_l;
+    if (out_r) *out_r = s_out_peak_r;
+    s_out_peak_l = 0; s_out_peak_r = 0;
 }
 
 static void codec_vol_ramp(int from, int to, int step_ms);

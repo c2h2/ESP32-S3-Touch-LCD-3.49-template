@@ -41,6 +41,13 @@ int          radio_current_index(void);
    radio_stop so callers can resume by passing it back to radio_play. */
 const char  *radio_current_uri(void);
 
+/* Output-side VU: peak abs sample per channel seen in the most
+   recently decoded PCM chunk. Reading also resets, so successive
+   calls return per-poll-interval levels. Use to drive a playback VU
+   meter in the UI. Returns 0/0 when nothing is decoding. */
+#include <stdint.h>
+void         radio_out_peak(uint16_t *out_l, uint16_t *out_r);
+
 /* Output volume 0..100. Applied through the ES8311 codec, so it's a real
    analog gain change (not just a digital scale). */
 void         radio_set_volume(int vol_0_100);

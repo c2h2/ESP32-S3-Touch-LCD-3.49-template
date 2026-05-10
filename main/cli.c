@@ -172,8 +172,12 @@ static int cmd_rec_list(int argc, char **argv)
 static int cmd_rec_status(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    printf("recording=%d elapsed=%us\n",
-           (int)recorder_is_recording(), recorder_elapsed_s());
+    uint16_t out_l = 0, out_r = 0;
+    radio_out_peak(&out_l, &out_r);
+    printf("recording=%d elapsed=%us  playing=%d  out_peak L=%u R=%u\n",
+           (int)recorder_is_recording(), recorder_elapsed_s(),
+           (int)radio_is_playing(),
+           (unsigned)out_l, (unsigned)out_r);
     return 0;
 }
 
