@@ -1,18 +1,28 @@
 /* radio.c -- internet-radio engine: HTTP/HTTPS stream -> esp_audio_simple_player
- * -> esp_codec_dev (ES8311 over I2C+I2S). Stage-1 minimum: bring up the codec,
- * play a URI, stop on demand. ICY metadata, station list, and player UI live
- * one layer up. */
+ * -> esp_codec_dev (ES8311 + ES7210 over I2C+I2S TDM). Reworked to match the
+ * reference 08_Audio_Test pattern that's known to record AND play correctly
+ * on this board:
+ *
+ *   - Single duplex i2s_new_channel call (TX + RX)
+ *   - I2S TDM mode, 32-bit slot, STEREO, 4 total slots, 16 kHz base
+ *   - One shared audio_codec_data_if_t with BOTH tx_handle and rx_handle
+ *   - ES8311 codec_if (DAC) -> play_dev with shared data_if
+ *   - ES7210 codec_if (ADC) -> record_dev with same shared data_if
+ *
+ * Recorder reuses radio's record_dev directly via radio_get_record_dev().
+ */
 
 #include <string.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "driver/i2s_std.h"
+#include "driver/i2s_tdm.h"
 #include "driver/i2c_master.h"
 
 #include "esp_codec_dev_defaults.h"
 #include "esp_codec_dev.h"
+#include "es7210_adc.h"
 
 #include "esp_audio_simple_player.h"
 
@@ -22,37 +32,44 @@
 
 static const char *TAG = "radio";
 
-/* Same wiring as audio_min/audio_min.c */
+/* From board_cfg.txt: S3_LCD_3_49. */
 #define PIN_I2S_MCLK   GPIO_NUM_7
 #define PIN_I2S_BCLK   GPIO_NUM_15
 #define PIN_I2S_LRCK   GPIO_NUM_46
 #define PIN_I2S_DOUT   GPIO_NUM_45
 #define PIN_I2S_DIN    GPIO_NUM_6
-/* esp_codec_dev's audio_codec_new_i2c_ctrl shifts the addr right by 1 before
-   handing it to i2c_master_bus_add_device, so we pass the 8-bit form here.
-   ES8311's 7-bit slave address is 0x18 -> 8-bit form 0x30. */
-#define ES8311_I2C_ADDR 0x30
+#define ES8311_I2C_ADDR 0x30           /* 8-bit form of 7-bit 0x18 */
+#define ES7210_I2C_ADDR 0x80           /* 8-bit form of 7-bit 0x40 */
+
+/* TDM base sample rate. The ES7210/ES8311 share BCLK/LRCK, so all
+   playback/record traffic is sample-rate-converted to/from this. */
+#define I2S_TDM_RATE   16000
 
 static i2s_chan_handle_t       s_i2s_tx     = NULL;
-static i2s_chan_handle_t       s_i2s_rx     = NULL;   /* shared with recorder */
-static esp_codec_dev_handle_t  s_codec      = NULL;
-static const audio_codec_ctrl_if_t *s_ctrl_if = NULL;     /* shared */
-static const audio_codec_data_if_t *s_data_if_in = NULL;  /* shared */
-static const audio_codec_if_t *s_codec_if   = NULL;       /* shared, single ES8311 driver instance */
+static i2s_chan_handle_t       s_i2s_rx     = NULL;
+static const audio_codec_data_if_t *s_data_if = NULL;     /* shared TX+RX */
+static const audio_codec_ctrl_if_t *s_ctrl_if_out = NULL;
+static const audio_codec_ctrl_if_t *s_ctrl_if_in  = NULL;
+static const audio_codec_gpio_if_t *s_gpio_if = NULL;
+static const audio_codec_if_t *s_out_codec_if = NULL;
+static const audio_codec_if_t *s_in_codec_if  = NULL;
+static esp_codec_dev_handle_t  s_play_dev   = NULL;
+static esp_codec_dev_handle_t  s_record_dev = NULL;
+
 static esp_asp_handle_t        s_player     = NULL;
 static volatile esp_asp_state_t s_state     = ESP_ASP_STATE_NONE;
 static int                     s_cur_idx    = -1;
 static char                    s_cur_uri[256] = {0};
 static int                     s_volume     = 70;  /* 0..100 */
-static uint32_t                s_cur_rate   = 44100;  /* last codec_dev_open sample rate */
-static uint8_t                 s_cur_bits   = 16;
-static uint8_t                 s_cur_ch     = 2;
+static uint32_t                s_cur_rate   = 0;
+static uint8_t                 s_cur_bits   = 0;
+static uint8_t                 s_cur_ch     = 0;
 
 static int radio_out_cb(uint8_t *data, int data_size, void *ctx)
 {
     (void)ctx;
-    if (!s_codec || !data || data_size <= 0) return 0;
-    int err = esp_codec_dev_write(s_codec, data, data_size);
+    if (!s_play_dev || !data || data_size <= 0) return 0;
+    int err = esp_codec_dev_write(s_play_dev, data, data_size);
     return err == ESP_CODEC_DEV_OK ? data_size : 0;
 }
 
@@ -71,14 +88,10 @@ static int radio_event_cb(esp_asp_event_pkt_t *pkt, void *ctx)
         memcpy(&info, pkt->payload, pkt->payload_size);
         ESP_LOGI(TAG, "music info: rate=%d ch=%d bits=%d",
                  info.sample_rate, info.channels, info.bits);
-        if (s_codec) {
+        if (s_play_dev) {
             uint32_t r = (uint32_t)info.sample_rate;
             uint8_t  b = (uint8_t)info.bits;
             uint8_t  c = (uint8_t)info.channels;
-            /* Only retune the codec if the format actually changed. Most
-               station-to-station switches are 44.1->44.1 or 48->48 stereo;
-               skipping the close/open in that case eliminates the audible
-               click that the I2S clock retune produces. */
             if (r != s_cur_rate || b != s_cur_bits || c != s_cur_ch) {
                 esp_codec_dev_sample_info_t fs = {
                     .bits_per_sample = b,
@@ -86,13 +99,12 @@ static int radio_event_cb(esp_asp_event_pkt_t *pkt, void *ctx)
                     .channel_mask    = 0,
                     .sample_rate     = r,
                 };
-                esp_codec_dev_close(s_codec);
-                esp_codec_dev_open(s_codec, &fs);
+                esp_codec_dev_close(s_play_dev);
+                esp_codec_dev_open(s_play_dev, &fs);
                 s_cur_rate = r;
                 s_cur_bits = b;
                 s_cur_ch   = c;
             }
-            /* Fade volume back up now that audio is flowing. */
             codec_vol_ramp(0, s_volume, 5);
         }
     }
@@ -106,22 +118,26 @@ esp_err_t radio_init(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "init step 1/8: i2s_new_channel (TX+RX duplex)");
+    ESP_LOGI(TAG, "init step 1/9: i2s_new_channel (TX+RX duplex)");
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num  = 6;
-    chan_cfg.dma_frame_num = 240;
-    /* Allocate TX *and* RX in the same call. Doing this here once means
-       the recorder can reuse s_i2s_rx without fighting the I2S driver
-       for "controller occupied" errors, and both directions share the
-       same BCLK/LRCK pair. */
+    chan_cfg.id = I2S_NUM_AUTO;
+    chan_cfg.auto_clear = true;
+    /* TDM with 4 slots * 32 bits * stereo at 16 kHz produces big DMA
+       descriptors. The reference example runs before LVGL when there's
+       still plenty of internal RAM; we run after, with internal heap
+       fragmented. Cut descriptor count down so the alloc fits. */
+    chan_cfg.dma_desc_num  = 3;
+    chan_cfg.dma_frame_num = 64;
     esp_err_t er = i2s_new_channel(&chan_cfg, &s_i2s_tx, &s_i2s_rx);
     if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_new_channel: %s", esp_err_to_name(er)); return er; }
 
-    ESP_LOGI(TAG, "init step 2/8: i2s_channel_init_std_mode @ 44100");
-    i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                       I2S_SLOT_MODE_STEREO),
+    ESP_LOGI(TAG, "init step 2/9: i2s_channel_init_tdm_mode @ %dHz / 32-bit / 4 slots", I2S_TDM_RATE);
+    /* TDM mode is what the reference uses to share one I2S frame
+       between the ES8311 DAC slots and the ES7210 ADC slots. */
+    i2s_tdm_slot_mask_t slot_mask = I2S_TDM_SLOT0 | I2S_TDM_SLOT1 | I2S_TDM_SLOT2 | I2S_TDM_SLOT3;
+    i2s_tdm_config_t tdm_cfg = {
+        .clk_cfg  = I2S_TDM_CLK_DEFAULT_CONFIG(I2S_TDM_RATE),
+        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(32, I2S_SLOT_MODE_STEREO, slot_mask),
         .gpio_cfg = {
             .mclk = PIN_I2S_MCLK,
             .bclk = PIN_I2S_BCLK,
@@ -130,77 +146,94 @@ esp_err_t radio_init(void)
             .din  = PIN_I2S_DIN,
         },
     };
-    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-    er = i2s_channel_init_std_mode(s_i2s_tx, &std_cfg);
-    if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_init_std tx: %s", esp_err_to_name(er)); return er; }
-    er = i2s_channel_init_std_mode(s_i2s_rx, &std_cfg);
-    if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_init_std rx: %s", esp_err_to_name(er)); return er; }
+    tdm_cfg.slot_cfg.total_slot = 4;
+    er = i2s_channel_init_tdm_mode(s_i2s_tx, &tdm_cfg);
+    if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_init_tdm tx: %s", esp_err_to_name(er)); return er; }
+    er = i2s_channel_init_tdm_mode(s_i2s_rx, &tdm_cfg);
+    if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_init_tdm rx: %s", esp_err_to_name(er)); return er; }
     er = i2s_channel_enable(s_i2s_tx);
     if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_enable tx: %s", esp_err_to_name(er)); return er; }
     er = i2s_channel_enable(s_i2s_rx);
     if (er != ESP_OK) { ESP_LOGE(TAG, "i2s_enable rx: %s", esp_err_to_name(er)); return er; }
 
-    ESP_LOGI(TAG, "init step 3/8: audio_codec_new_i2c_ctrl bus=%p addr=0x%02x",
-             esp_i2c_bus_handle, ES8311_I2C_ADDR);
-    audio_codec_i2c_cfg_t i2c_cfg = {
-        .addr    = ES8311_I2C_ADDR,
-        .bus_handle = esp_i2c_bus_handle,
-    };
-    s_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
-    if (!s_ctrl_if) { ESP_LOGE(TAG, "i2c ctrl create failed"); return ESP_FAIL; }
-
-    ESP_LOGI(TAG, "init step 4/8: audio_codec_new_i2s_data (TX) + (RX)");
-    audio_codec_i2s_cfg_t i2s_cfg_tx = {
+    ESP_LOGI(TAG, "init step 3/9: shared data_if (TX+RX)");
+    audio_codec_i2s_cfg_t i2s_data_cfg = {
         .port      = I2S_NUM_0,
         .tx_handle = s_i2s_tx,
-        .rx_handle = NULL,
-    };
-    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg_tx);
-    if (!data_if) { ESP_LOGE(TAG, "i2s data create (tx) failed"); return ESP_FAIL; }
-    audio_codec_i2s_cfg_t i2s_cfg_rx = {
-        .port      = I2S_NUM_0,
-        .tx_handle = NULL,
         .rx_handle = s_i2s_rx,
     };
-    s_data_if_in = audio_codec_new_i2s_data(&i2s_cfg_rx);
-    if (!s_data_if_in) { ESP_LOGE(TAG, "i2s data create (rx) failed"); return ESP_FAIL; }
+    s_data_if = audio_codec_new_i2s_data(&i2s_data_cfg);
+    if (!s_data_if) { ESP_LOGE(TAG, "data_if create failed"); return ESP_FAIL; }
 
-    ESP_LOGI(TAG, "init step 5/8: es8311_codec_new (DAC only)");
-    /* ES8311 is wired as the OUTPUT codec on this board. The mic input
-       is on a separate ES7210 chip (the recorder owns that). Setting
-       WORK_MODE_BOTH here mutes the DAC output on this hardware --
-       audio playback was silent until we switched back to DAC. */
-    es8311_codec_cfg_t es_cfg = {
-        .ctrl_if   = s_ctrl_if,
-        .gpio_if   = audio_codec_new_gpio(),
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
-        .master_mode = false,
-        .use_mclk  = true,
+    s_gpio_if = audio_codec_new_gpio();
+
+    ESP_LOGI(TAG, "init step 4/9: ES8311 ctrl_if + codec_if (DAC)");
+    audio_codec_i2c_cfg_t out_i2c = {
+        .addr       = ES8311_I2C_ADDR,
+        .bus_handle = esp_i2c_bus_handle,
     };
-    s_codec_if = es8311_codec_new(&es_cfg);
-    if (!s_codec_if) { ESP_LOGE(TAG, "es8311_codec_new failed"); return ESP_FAIL; }
-    const audio_codec_if_t *codec_if = s_codec_if;
+    s_ctrl_if_out = audio_codec_new_i2c_ctrl(&out_i2c);
+    if (!s_ctrl_if_out) { ESP_LOGE(TAG, "es8311 ctrl create failed"); return ESP_FAIL; }
+    es8311_codec_cfg_t es8311_cfg = {
+        .codec_mode      = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .ctrl_if         = s_ctrl_if_out,
+        .gpio_if         = s_gpio_if,
+        .pa_pin          = -1,         /* board_cfg: pa: -1 */
+        .use_mclk        = true,
+        .hw_gain.pa_gain = 6,          /* board_cfg: pa_gain: 6 */
+    };
+    s_out_codec_if = es8311_codec_new(&es8311_cfg);
+    if (!s_out_codec_if) { ESP_LOGE(TAG, "es8311_codec_new failed"); return ESP_FAIL; }
 
-    ESP_LOGI(TAG, "init step 6/8: esp_codec_dev_new");
-    esp_codec_dev_cfg_t dev_cfg = {
+    ESP_LOGI(TAG, "init step 5/9: play_dev = ES8311 + shared data_if");
+    esp_codec_dev_cfg_t play_cfg = {
+        .codec_if = s_out_codec_if,
+        .data_if  = s_data_if,
         .dev_type = ESP_CODEC_DEV_TYPE_OUT,
-        .codec_if = codec_if,
-        .data_if  = data_if,
     };
-    s_codec = esp_codec_dev_new(&dev_cfg);
-    if (!s_codec) { ESP_LOGE(TAG, "codec_dev_new failed"); return ESP_FAIL; }
+    s_play_dev = esp_codec_dev_new(&play_cfg);
+    if (!s_play_dev) { ESP_LOGE(TAG, "play_dev create failed"); return ESP_FAIL; }
 
-    ESP_LOGI(TAG, "init step 7/8: esp_codec_dev_open");
-    esp_codec_dev_set_out_vol(s_codec, s_volume);
+    ESP_LOGI(TAG, "init step 6/9: ES7210 ctrl_if + codec_if (ADC, all 4 mics)");
+    audio_codec_i2c_cfg_t in_i2c = {
+        .addr       = ES7210_I2C_ADDR,
+        .bus_handle = esp_i2c_bus_handle,
+    };
+    s_ctrl_if_in = audio_codec_new_i2c_ctrl(&in_i2c);
+    if (!s_ctrl_if_in) { ESP_LOGE(TAG, "es7210 ctrl create failed"); return ESP_FAIL; }
+    es7210_codec_cfg_t es7210_cfg = {
+        .ctrl_if      = s_ctrl_if_in,
+        /* TDM with 4 slots: enable all 4 mics so the ADC drives every
+           slot. The reference sets MIC1|MIC3 then OR-s MIC2|MIC4 for TDM. */
+        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4,
+    };
+    s_in_codec_if = es7210_codec_new(&es7210_cfg);
+    if (!s_in_codec_if) { ESP_LOGE(TAG, "es7210_codec_new failed"); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "init step 7/9: record_dev = ES7210 + same shared data_if");
+    esp_codec_dev_cfg_t rec_cfg = {
+        .codec_if = s_in_codec_if,
+        .data_if  = s_data_if,
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+    };
+    s_record_dev = esp_codec_dev_new(&rec_cfg);
+    if (!s_record_dev) { ESP_LOGE(TAG, "record_dev create failed"); return ESP_FAIL; }
+
+    ESP_LOGI(TAG, "init step 8/9: open codec devs at default fs");
+    esp_codec_dev_set_out_vol(s_play_dev, s_volume);
+    esp_codec_dev_set_in_gain(s_record_dev, 30.0f);
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
         .channel         = 2,
         .sample_rate     = 44100,
     };
-    int rc = esp_codec_dev_open(s_codec, &fs);
-    if (rc != ESP_CODEC_DEV_OK) { ESP_LOGE(TAG, "codec_dev_open: rc=%d", rc); return ESP_FAIL; }
+    int rc = esp_codec_dev_open(s_play_dev, &fs);
+    if (rc != ESP_CODEC_DEV_OK) { ESP_LOGE(TAG, "play_dev open: %d", rc); return ESP_FAIL; }
+    s_cur_rate = 44100; s_cur_bits = 16; s_cur_ch = 2;
+    /* Don't open the record_dev here -- recorder_init() opens it on
+       demand at the rate it wants for capture. */
 
-    ESP_LOGI(TAG, "init step 8/8: esp_audio_simple_player_new");
+    ESP_LOGI(TAG, "init step 9/9: esp_audio_simple_player_new");
     esp_asp_cfg_t cfg = {
         .out.cb       = radio_out_cb,
         .out.user_ctx = NULL,
@@ -219,45 +252,36 @@ esp_err_t radio_init(void)
     return ESP_OK;
 }
 
-/* Push N samples of digital silence into the I2S TX so any partial frame
-   left in the DMA ring is overwritten before we mute or change rate. */
 static void codec_drain_silence(void)
 {
-    if (!s_codec) return;
-    static int16_t zero[256] = {0};  /* 64 stereo frames */
+    if (!s_play_dev) return;
+    static int16_t zero[256] = {0};
     for (int i = 0; i < 8; i++) {
-        esp_codec_dev_write(s_codec, zero, sizeof(zero));
+        esp_codec_dev_write(s_play_dev, zero, sizeof(zero));
     }
 }
 
-/* Soft volume ramp: walk from `from` to `to` in `step_ms` ms steps. This
-   masks the DAC zipper-noise that you get from a hard 0 -> 70 jump. */
 static void codec_vol_ramp(int from, int to, int step_ms)
 {
-    if (!s_codec) return;
+    if (!s_play_dev) return;
     if (from == to) {
-        esp_codec_dev_set_out_vol(s_codec, to);
+        esp_codec_dev_set_out_vol(s_play_dev, to);
         return;
     }
     int dir = (to > from) ? 1 : -1;
     for (int v = from; v != to; v += dir) {
-        esp_codec_dev_set_out_vol(s_codec, v);
+        esp_codec_dev_set_out_vol(s_play_dev, v);
         vTaskDelay(pdMS_TO_TICKS(step_ms));
     }
-    esp_codec_dev_set_out_vol(s_codec, to);
+    esp_codec_dev_set_out_vol(s_play_dev, to);
 }
 
 esp_err_t radio_play(const char *uri)
 {
     if (!s_player) return ESP_ERR_INVALID_STATE;
     if (!uri || !*uri) return ESP_ERR_INVALID_ARG;
-    /* Fade out the current stream (if any) before tearing down the
-       pipeline. radio_event_cb fades back up when the new stream's
-       MUSIC_INFO arrives so the user hears a clean cross-fade rather
-       than a "zzz" tail + click + ramp. The codec stays open, the I2S
-       channel stays running -- no hardware re-init around the transition. */
-    if (s_codec) {
-        codec_vol_ramp(s_volume, 0, 5);  /* ~5*70 = 350 ms fade-out */
+    if (s_play_dev) {
+        codec_vol_ramp(s_volume, 0, 5);
     }
     esp_audio_simple_player_stop(s_player);
     codec_drain_silence();
@@ -278,10 +302,7 @@ const char *radio_current_uri(void)
 esp_err_t radio_stop(void)
 {
     if (!s_player) return ESP_ERR_INVALID_STATE;
-    /* Fade out, then stop the decoder pipeline. The codec stays open and
-       at volume 0; next radio_play() resumes from there and ramps up
-       when audio starts flowing. No mute toggle, no codec close. */
-    if (s_codec) {
+    if (s_play_dev) {
         codec_vol_ramp(s_volume, 0, 5);
     }
     esp_audio_simple_player_stop(s_player);
@@ -323,11 +344,8 @@ void radio_set_volume(int v)
     if (v < 0) v = 0;
     if (v > 100) v = 100;
     s_volume = v;
-    /* Only push the new volume to the codec if we're actively playing.
-       When stopped the codec sits at 0 (faded out by radio_stop); the
-       MUSIC_INFO handler ramps to s_volume next time playback starts. */
-    if (s_codec && s_state == ESP_ASP_STATE_RUNNING) {
-        esp_codec_dev_set_out_vol(s_codec, v);
+    if (s_play_dev && s_state == ESP_ASP_STATE_RUNNING) {
+        esp_codec_dev_set_out_vol(s_play_dev, v);
     }
 }
 
@@ -335,22 +353,17 @@ int radio_get_volume(void) { return s_volume; }
 
 void radio_beep(void)
 {
-    if (!s_codec) return;
-    /* 1 second of 880 Hz square wave at the codec's current 44.1 kHz
-       stereo / 16-bit format. Direct esp_codec_dev_write so we don't
-       go through the simple_player pipeline -- this isolates "is the
-       DAC + speaker chain alive?" from "does file decode work?" */
-    int rate = 44100;
-    int n_frames = rate;                  /* 1.0 s at 44.1 kHz */
-    int half_period = rate / 880 / 2;     /* samples per half period */
+    if (!s_play_dev) return;
+    int rate = s_cur_rate ? s_cur_rate : 44100;
+    int n_frames = rate;
+    int half_period = rate / 880 / 2;
     int amp = 8000;
     int chunk_frames = 256;
     int16_t buf[256 * 2];
     int hi = 1;
     int phase = 0;
-    /* Push at full volume during the beep, then restore. */
     int saved_vol = s_volume;
-    esp_codec_dev_set_out_vol(s_codec, 70);
+    esp_codec_dev_set_out_vol(s_play_dev, 70);
     int written = 0;
     while (written < n_frames) {
         int this_n = (n_frames - written < chunk_frames) ? (n_frames - written) : chunk_frames;
@@ -360,25 +373,27 @@ void radio_beep(void)
             buf[2 * i + 1] = s;
             if (++phase >= half_period) { phase = 0; hi = !hi; }
         }
-        esp_codec_dev_write(s_codec, buf, this_n * 2 * sizeof(int16_t));
+        esp_codec_dev_write(s_play_dev, buf, this_n * 2 * sizeof(int16_t));
         written += this_n;
     }
-    /* Flush DMA with silence so the codec doesn't keep repeating the
-       last buffer of square wave (the I2S DMA ring would otherwise
-       loop on stale tone samples). ~100 ms of zeros covers the 6 DMA
-       descriptors x 240 frames buffered ahead. */
     memset(buf, 0, sizeof(buf));
     int silence_frames = rate / 10;
     int s_written = 0;
     while (s_written < silence_frames) {
         int this_n = (silence_frames - s_written < chunk_frames) ? (silence_frames - s_written) : chunk_frames;
-        esp_codec_dev_write(s_codec, buf, this_n * 2 * sizeof(int16_t));
+        esp_codec_dev_write(s_play_dev, buf, this_n * 2 * sizeof(int16_t));
         s_written += this_n;
     }
-    esp_codec_dev_set_out_vol(s_codec, saved_vol);
+    esp_codec_dev_set_out_vol(s_play_dev, saved_vol);
 }
 
+/* Recorder accessors. With the new architecture the recorder doesn't
+   build its own codec_if -- it uses the record_dev that radio_init
+   created with the shared data_if. */
+void *radio_get_record_dev(void)        { return (void *)s_record_dev; }
+void *radio_get_play_dev(void)          { return (void *)s_play_dev; }
+/* Legacy accessors retained for ABI; not used by the new recorder. */
 void *radio_get_i2s_rx_handle(void)     { return (void *)s_i2s_rx; }
-void *radio_get_codec_ctrl_if(void)     { return (void *)s_ctrl_if; }
-void *radio_get_codec_data_if_in(void)  { return (void *)s_data_if_in; }
-void *radio_get_codec_if(void)          { return (void *)s_codec_if; }
+void *radio_get_codec_ctrl_if(void)     { return (void *)s_ctrl_if_in; }
+void *radio_get_codec_data_if_in(void)  { return (void *)s_data_if; }
+void *radio_get_codec_if(void)          { return (void *)s_out_codec_if; }

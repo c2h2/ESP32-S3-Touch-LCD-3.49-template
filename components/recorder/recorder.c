@@ -64,6 +64,11 @@ static TaskHandle_t             s_worker     = NULL;
    Stereo capture, two channels interleaved (L, R, L, R...). */
 static volatile uint16_t        s_peak_l     = 0;
 static volatile uint16_t        s_peak_r     = 0;
+/* Session peaks (don't reset on read) so we can confirm at rec_stop
+   that the mic actually captured signal, not zeros. */
+static volatile uint16_t        s_session_peak_l = 0;
+static volatile uint16_t        s_session_peak_r = 0;
+static volatile uint32_t        s_nonzero_samples = 0;
 /* Playback state we paused so we can resume on rec_stop. radio_play
    parks the URL string in radio.c; this just remembers whether
    playback was active when we started recording. */
@@ -126,9 +131,19 @@ static void recorder_task(void *arg)
         }
         if (peak_l > s_peak_l) s_peak_l = peak_l;
         if (peak_r > s_peak_r) s_peak_r = peak_r;
-        if (s_recording && s_fp) {
-            size_t w = fwrite(buf, 1, buf_bytes, s_fp);
-            if (w == (size_t)buf_bytes) s_pcm_bytes += buf_bytes;
+        if (s_recording) {
+            if (peak_l > s_session_peak_l) s_session_peak_l = peak_l;
+            if (peak_r > s_session_peak_r) s_session_peak_r = peak_r;
+            /* Count how many samples in this chunk were non-zero so we
+               can tell at stop time whether the mic actually delivered
+               signal (vs all zeros from a misconfigured codec path). */
+            for (int i = 0; i < REC_CHUNK; i++) {
+                if (buf[2*i] != 0 || buf[2*i+1] != 0) s_nonzero_samples++;
+            }
+            if (s_fp) {
+                size_t w = fwrite(buf, 1, buf_bytes, s_fp);
+                if (w == (size_t)buf_bytes) s_pcm_bytes += buf_bytes;
+            }
         }
     }
     free(buf);
@@ -154,48 +169,17 @@ esp_err_t recorder_init(void)
     if (s_init_done) return ESP_OK;
     mkdir(REC_DIR, 0775);
 
-    /* The MIC on this board is wired to a SEPARATE codec chip (ES7210
-       at I2C 7-bit 0x40 / 8-bit 0x80), not to the ES8311 ADC that
-       audio_codec_dev exposes by default. Reading from ES8311 in IN
-       mode returns silent zeros because no mic signal is wired to its
-       ADC inputs. Use the radio's RX I2S (the chip pin layout is
-       shared via TDM) but instantiate ES7210 as the input codec_if
-       so the right device is configured for capture. */
-    void *rx = radio_get_i2s_rx_handle();
-    void *data_if_in_v = radio_get_codec_data_if_in();
-    if (!rx || !data_if_in_v) {
-        ESP_LOGE(TAG, "radio engine not up (rx=%p data=%p)", rx, data_if_in_v);
+    /* The radio engine has already created an ES7210-backed record_dev
+       that shares the same TDM data_if as the play_dev (the reference
+       08_Audio_Test pattern). Just reuse it -- creating a second
+       codec_if/dev_new for the same chip races on I2C and produces
+       silent (zero) reads. */
+    void *rec_v = radio_get_record_dev();
+    if (!rec_v) {
+        ESP_LOGE(TAG, "radio_get_record_dev() returned NULL");
         return ESP_ERR_INVALID_STATE;
     }
-    const audio_codec_data_if_t *data_if = (const audio_codec_data_if_t *)data_if_in_v;
-
-    /* Dedicated I2C ctrl_if for the ES7210 (different address than ES8311). */
-    audio_codec_i2c_cfg_t i2c_cfg = {
-        .addr       = 0x80,                /* ES7210 default 8-bit addr */
-        .bus_handle = esp_i2c_bus_handle,
-    };
-    const audio_codec_ctrl_if_t *es7210_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
-    if (!es7210_ctrl_if) {
-        ESP_LOGE(TAG, "es7210 i2c ctrl create failed");
-        return ESP_FAIL;
-    }
-    es7210_codec_cfg_t es7210_cfg = {
-        .ctrl_if      = es7210_ctrl_if,
-        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC3,
-    };
-    const audio_codec_if_t *codec_if = es7210_codec_new(&es7210_cfg);
-    if (!codec_if) {
-        ESP_LOGE(TAG, "es7210_codec_new failed -- mic chip not present?");
-        return ESP_FAIL;
-    }
-
-    esp_codec_dev_cfg_t dev_cfg = {
-        .dev_type = ESP_CODEC_DEV_TYPE_IN,
-        .codec_if = codec_if,
-        .data_if  = data_if,
-    };
-    s_codec_in = esp_codec_dev_new(&dev_cfg);
-    if (!s_codec_in) return ESP_FAIL;
+    s_codec_in = (esp_codec_dev_handle_t)rec_v;
 
     esp_codec_dev_set_in_gain(s_codec_in, 30.0f);
     esp_codec_dev_sample_info_t fs = {
@@ -207,7 +191,7 @@ esp_err_t recorder_init(void)
     if (rc != ESP_CODEC_DEV_OK) { ESP_LOGE(TAG, "codec_dev_open(in): %d", rc); return ESP_FAIL; }
 
     s_init_done = true;
-    ESP_LOGI(TAG, "recorder ready (ES7210 mic, sharing I2S RX from radio)");
+    ESP_LOGI(TAG, "recorder ready (using radio's record_dev)");
     return ESP_OK;
 }
 
@@ -258,6 +242,9 @@ esp_err_t recorder_start(const char **out_path)
     }
     /* Reserve space for the header; we patch it on stop. */
     s_pcm_bytes = 0;
+    s_session_peak_l = 0;
+    s_session_peak_r = 0;
+    s_nonzero_samples = 0;
     wav_write_header(s_fp, 0, REC_RATE, REC_BITS, REC_CHANNELS);
 
     s_started_ms = (uint32_t)(esp_log_timestamp());
@@ -318,7 +305,10 @@ esp_err_t recorder_stop(void)
         fclose(s_fp);
         s_fp = NULL;
     }
-    ESP_LOGI(TAG, "stopped, %lu bytes pcm", (unsigned long)s_pcm_bytes);
+    ESP_LOGI(TAG, "stopped, %lu bytes pcm  peak L=%u R=%u  nonzero_samples=%lu",
+             (unsigned long)s_pcm_bytes,
+             (unsigned)s_session_peak_l, (unsigned)s_session_peak_r,
+             (unsigned long)s_nonzero_samples);
     /* Resume whatever was playing before recording started. */
     if (s_paused_pb_was_playing && s_paused_pb_uri[0]) {
         ESP_LOGI(TAG, "resuming playback: %s", s_paused_pb_uri);

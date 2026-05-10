@@ -57,6 +57,8 @@ void  *radio_get_i2s_rx_handle(void);
 void  *radio_get_codec_ctrl_if(void);
 void  *radio_get_codec_data_if_in(void);  /* IN-direction data_if */
 void  *radio_get_codec_if(void);          /* shared ES8311 codec_if */
+void  *radio_get_record_dev(void);        /* preconfigured ES7210 esp_codec_dev_handle_t */
+void  *radio_get_play_dev(void);          /* ES8311 play dev */
 
 #ifdef __cplusplus
 }
