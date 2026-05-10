@@ -53,6 +53,7 @@
 static const char *TAG = "skeleton";
 
 /* Custom JetBrains Mono Bold fonts, generated via lv_font_conv. */
+extern "C" const lv_font_t font_jbmono_24;
 extern "C" const lv_font_t font_jbmono_48;
 extern "C" const lv_font_t font_jbmono_64;
 extern "C" const lv_font_t font_jbmono_96;
@@ -1528,11 +1529,14 @@ static void sunmap_update_cb(lv_timer_t *t);
 
 static const lv_font_t *clock_size_to_font(uint8_t size)
 {
+    /* All four tiers use jbmono so digits + custom Latin text share
+       the same bold mono look. Sizes were generated with the full
+       ASCII printable set so user text renders correctly. */
     switch (size) {
-        case 0: return &lv_font_montserrat_16;   /* XS */
-        case 1: return &font_jbmono_48;          /* S  */
-        case 2: return &font_jbmono_64;          /* M  */
-        default:return &font_jbmono_96;          /* L  */
+        case 0: return &font_jbmono_24;   /* XS */
+        case 1: return &font_jbmono_48;   /* S  */
+        case 2: return &font_jbmono_64;   /* M  */
+        default:return &font_jbmono_96;   /* L  */
     }
 }
 
@@ -1552,20 +1556,7 @@ static void clock_apply_layout(void)
         return;
     }
     lv_obj_clear_flag(g_clock_time_label, LV_OBJ_FLAG_HIDDEN);
-    /* Custom text uses Montserrat (full Latin set). The jbmono digit
-       fonts only contain "0123456789:-+./ UTC" so letters render as
-       empty boxes; switch to montserrat_48 (largest available) for
-       L/M, montserrat_16 for S, montserrat_14 for XS. */
-    const lv_font_t *time_font;
-    if (g_cfg.clock_text[0]) {
-        switch (g_cfg.clock_size) {
-            case 0: time_font = &lv_font_montserrat_14; break;
-            case 1: time_font = &lv_font_montserrat_16; break;
-            default: time_font = &lv_font_montserrat_48; break;
-        }
-    } else {
-        time_font = clock_size_to_font(g_cfg.clock_size);
-    }
+    const lv_font_t *time_font = clock_size_to_font(g_cfg.clock_size);
     /* ms font is one tier smaller than the time, clamped at 12. */
     const lv_font_t *ms_font = clock_size_to_font(
         g_cfg.clock_size > 0 ? (uint8_t)(g_cfg.clock_size - 1) : 0);

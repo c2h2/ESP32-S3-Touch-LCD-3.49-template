@@ -1,5 +1,6 @@
 idf_component_register(SRCS "main.cpp" "cli.c" "i18n.c" "font_cjk_14.c"
-                          "font_jbmono_48.c" "font_jbmono_64.c" "font_jbmono_96.c"
+                          "font_jbmono_24.c" "font_jbmono_48.c"
+                          "font_jbmono_64.c" "font_jbmono_96.c"
                     INCLUDE_DIRS "."
                     REQUIRES audio_min radio recorder webui esp_timer esp_lcd driver
                              i2c_bsp i2c_equipment lcd_bl_pwm_bsp adc_bsp
