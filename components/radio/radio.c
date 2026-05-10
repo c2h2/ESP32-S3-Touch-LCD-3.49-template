@@ -69,17 +69,32 @@ static uint8_t                 s_cur_ch     = 0;
    bar. Resets to 0 when nothing is being decoded. */
 static volatile uint16_t       s_out_peak_l = 0;
 static volatile uint16_t       s_out_peak_r = 0;
+/* Digital gain applied to decoded samples in radio_out_cb. Internet
+   streams are already loudness-normalized; user-recorded WAVs have
+   peaks at ~2% FS so we boost local files by ~8x. Set in radio_play
+   based on the URI scheme. */
+static int                     s_out_gain_q8 = 256;   /* Q8.8: 256 = 1.0x */
 
 static int radio_out_cb(uint8_t *data, int data_size, void *ctx)
 {
     (void)ctx;
     if (!s_play_dev || !data || data_size <= 0) return 0;
-    /* Peak-track the decoded PCM. simple_player feeds 16-bit PCM in
-       the codec's currently configured channel layout; both mono and
-       stereo work here since we treat it as a stream of int16_t. */
+    /* Apply digital gain in-place (set per-URI by radio_play). Clip
+       on saturation so loud transients don't wrap. Then peak-track
+       the post-gain values so the output VU reflects what's actually
+       hitting the speaker. */
     if (s_cur_bits == 16) {
-        const int16_t *p = (const int16_t *)data;
+        int16_t *p = (int16_t *)data;
         int n_samples = data_size / 2;
+        int gain = s_out_gain_q8;
+        if (gain != 256) {
+            for (int i = 0; i < n_samples; i++) {
+                int v = ((int)p[i] * gain) >> 8;
+                if (v > 32767) v = 32767;
+                else if (v < -32768) v = -32768;
+                p[i] = (int16_t)v;
+            }
+        }
         uint16_t pl = 0, pr = 0;
         if (s_cur_ch == 2) {
             int frames = n_samples / 2;
@@ -258,7 +273,11 @@ esp_err_t radio_init(void)
 
     ESP_LOGI(TAG, "init step 8/9: open codec devs at default fs");
     esp_codec_dev_set_out_vol(s_play_dev, s_volume);
-    esp_codec_dev_set_in_gain(s_record_dev, 30.0f);
+    /* 42 dB analog gain on the ES7210. Reference 08_Audio_Test uses
+       30 dB for echo demos; for voice recording 42 dB matches typical
+       handheld mic preamps and brings recorded peaks closer to FS so
+       playback doesn't sound 10x quieter than internet radio. */
+    esp_codec_dev_set_in_gain(s_record_dev, 42.0f);
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
         .channel         = 2,
@@ -317,12 +336,22 @@ esp_err_t radio_play(const char *uri)
 {
     if (!s_player) return ESP_ERR_INVALID_STATE;
     if (!uri || !*uri) return ESP_ERR_INVALID_ARG;
+    /* Decide playback gain by URI scheme. Local recordings have peaks
+       at ~2% full-scale because the ES7210 is set to 30 dB in_gain;
+       internet streams come in already loudness-normalized. Boost
+       file:// playback by 8x (clipping on saturation) so it sounds
+       comparable to internet radio. */
+    if (strncmp(uri, "file://", 7) == 0) {
+        s_out_gain_q8 = 256 * 8;   /* +18 dB */
+    } else {
+        s_out_gain_q8 = 256;       /* unity */
+    }
     if (s_play_dev) {
         codec_vol_ramp(s_volume, 0, 5);
     }
     esp_audio_simple_player_stop(s_player);
     codec_drain_silence();
-    ESP_LOGI(TAG, "play: %s", uri);
+    ESP_LOGI(TAG, "play: %s (gain x%d)", uri, s_out_gain_q8 / 256);
     esp_gmf_err_t err = esp_audio_simple_player_run(s_player, uri, NULL);
     if (err == ESP_OK) {
         strncpy(s_cur_uri, uri, sizeof(s_cur_uri) - 1);

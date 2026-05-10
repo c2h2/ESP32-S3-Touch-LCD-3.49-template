@@ -191,7 +191,11 @@ esp_err_t recorder_init(void)
     }
     s_codec_in = (esp_codec_dev_handle_t)rec_v;
 
-    esp_codec_dev_set_in_gain(s_codec_in, 30.0f);
+    /* Bump from the reference's 30 dB to 42 dB so recordings have
+       room-level peaks closer to full scale. The play-side digital
+       gain in radio.c also boosts file:// playback by 8x for legacy
+       low-amplitude recordings. */
+    esp_codec_dev_set_in_gain(s_codec_in, 42.0f);
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = REC_BITS,
         .channel         = REC_CHANNELS,
