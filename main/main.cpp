@@ -1124,6 +1124,10 @@ extern "C" void app_cfg_set_clock_text(const char *s)
     if (!s) s = "";
     strncpy(g_cfg.clock_text, s, sizeof(g_cfg.clock_text) - 1);
     g_cfg.clock_text[sizeof(g_cfg.clock_text) - 1] = 0;
+    /* Setting a non-empty text means "show this on the clock face"
+       -- auto-enable show_clock so the user doesn't have to also
+       toggle the visibility checkbox. */
+    if (g_cfg.clock_text[0]) g_cfg.show_clock = 1;
     if (lvgl_lock(50)) {
         if (g_cfg.clock_text[0] && g_clock_time_label) {
             lv_label_set_text(g_clock_time_label, g_cfg.clock_text);
