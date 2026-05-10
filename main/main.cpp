@@ -108,6 +108,9 @@ typedef struct {
     uint32_t clock_rgba;       /* 0xRRGGBBAA */
     uint8_t  show_clock;       /* 1 = render the time face; 0 = sun map only */
     char     clock_text[40];   /* if non-empty: render this string in place of HH:MM */
+    uint8_t  bg_mode;          /* 0=sunmap, 1=custom(/sdcard/clock_bg.bin), 2=url */
+    uint16_t bg_refresh_s;     /* if mode=2: refresh every N seconds (0=never) */
+    char     bg_url[160];      /* http(s):// URL of raw RGB565 image canvas_w*canvas_h*2 bytes */
 } app_cfg_t;
 
 static app_cfg_t g_cfg = {
@@ -132,12 +135,17 @@ static app_cfg_t g_cfg = {
     .clock_rgba       = 0xFFFFFFFF,  /* white opaque */
     .show_clock       = 1,
     .clock_text       = {0},
+    .bg_mode          = 0,
+    .bg_refresh_s     = 0,
+    .bg_url           = {0},
 };
 
 static void cfg_load(void);
 static bool menu_input_blocked(void);
 static void recorder_refresh_list(void);
 static void clock_apply_layout(void);
+extern "C" void clock_bg_apply(void);
+static void bg_fetcher_ensure(void);
 static void cfg_save(void);
 static void cfg_save_ssid_pass(const char *ssid, const char *pass);
 static bool cfg_get_ssid_pass(const char *ssid, char *pass, size_t pass_len);
@@ -779,9 +787,17 @@ static void cfg_load(void)
     nvs_get_u8 (h, "clk_show",&shc);
     size_t ctl = sizeof(g_cfg.clock_text);
     nvs_get_str(h, "clk_text",g_cfg.clock_text, &ctl);
+    uint8_t  bgm = g_cfg.bg_mode;
+    uint16_t bgr = g_cfg.bg_refresh_s;
+    size_t   bgul = sizeof(g_cfg.bg_url);
+    nvs_get_u8 (h, "bg_mode",  &bgm);
+    nvs_get_u16(h, "bg_refr",  &bgr);
+    nvs_get_str(h, "bg_url",   g_cfg.bg_url, &bgul);
     nvs_get_str(h, "last_ssid", g_cfg.last_ssid, &sl);
     nvs_close(h);
     g_cfg.show_clock = shc ? 1 : 0;
+    g_cfg.bg_mode = bgm > 2 ? 0 : bgm;
+    g_cfg.bg_refresh_s = bgr;
     if (tzi >= TZ_CITY_COUNT) tzi = TZ_DEFAULT_CITY_INDEX;
     if (df > 2)  df  = 0;
     if (th > 2)  th  = 0;
@@ -851,6 +867,9 @@ static void cfg_save(void)
     nvs_set_u32(h, "clk_rgba",  g_cfg.clock_rgba);
     nvs_set_u8 (h, "clk_show",  g_cfg.show_clock);
     nvs_set_str(h, "clk_text",  g_cfg.clock_text);
+    nvs_set_u8 (h, "bg_mode",   g_cfg.bg_mode);
+    nvs_set_u16(h, "bg_refr",   g_cfg.bg_refresh_s);
+    nvs_set_str(h, "bg_url",    g_cfg.bg_url);
     nvs_set_str(h, "last_ssid", g_cfg.last_ssid);
     nvs_commit(h);
     nvs_close(h);
@@ -1120,6 +1139,43 @@ extern "C" void app_cfg_set_show_clock(int show)
     cfg_save();
 }
 extern "C" const char *app_cfg_get_clock_text(void) { return g_cfg.clock_text; }
+
+/* Background mode: 0=sunmap, 1=custom upload, 2=URL fetch. */
+extern "C" int  app_cfg_get_bg_mode(void)        { return g_cfg.bg_mode; }
+extern "C" int  app_cfg_get_bg_refresh_s(void)   { return g_cfg.bg_refresh_s; }
+extern "C" const char *app_cfg_get_bg_url(void)  { return g_cfg.bg_url; }
+extern "C" int  app_cfg_get_canvas_w(void)       { return canvas_w; }
+extern "C" int  app_cfg_get_canvas_h(void)       { return canvas_h; }
+extern "C" void app_cfg_set_bg_mode(int m)
+{
+    if (m < 0) m = 0;
+    if (m > 2) m = 2;
+    g_cfg.bg_mode = (uint8_t)m;
+    if (lvgl_lock(50)) { clock_bg_apply(); lvgl_unlock(); }
+    cfg_save();
+    if (m == 2) bg_fetcher_ensure();
+}
+extern "C" void app_cfg_set_bg_url(const char *url)
+{
+    if (!url) url = "";
+    strncpy(g_cfg.bg_url, url, sizeof(g_cfg.bg_url) - 1);
+    g_cfg.bg_url[sizeof(g_cfg.bg_url) - 1] = 0;
+    cfg_save();
+    if (g_cfg.bg_mode == 2) bg_fetcher_ensure();
+}
+extern "C" void app_cfg_set_bg_refresh_s(int s)
+{
+    if (s < 0) s = 0;
+    if (s > 24 * 3600) s = 24 * 3600;
+    g_cfg.bg_refresh_s = (uint16_t)s;
+    cfg_save();
+}
+/* webui calls this after writing the uploaded raw RGB565 to
+   /sdcard/clock_bg.bin so the next clock_bg_apply picks it up. */
+extern "C" void app_cfg_clock_bg_reload(void)
+{
+    if (lvgl_lock(50)) { clock_bg_apply(); lvgl_unlock(); }
+}
 extern "C" void app_cfg_set_clock_text(const char *s)
 {
     if (!s) s = "";
@@ -1620,7 +1676,7 @@ static void build_clock_tile(lv_obj_t *parent)
         g_sunmap_canvas = lv_canvas_create(parent);
         lv_canvas_set_buffer(g_sunmap_canvas, g_sunmap_buf, W, H, LV_IMG_CF_TRUE_COLOR);
         lv_obj_align(g_sunmap_canvas, LV_ALIGN_CENTER, 0, 0);
-        sunmap_redraw();
+        clock_bg_apply();
         if (!g_sunmap_timer) {
             g_sunmap_timer = lv_timer_create(sunmap_update_cb, SUNMAP_RECOMPUTE_MS, NULL);
         }
@@ -1750,7 +1806,154 @@ static void sunmap_redraw(void)
 static void sunmap_update_cb(lv_timer_t *t)
 {
     (void)t;
-    sunmap_redraw();
+    /* Only redraw the daylight map when the user actually wants it.
+       Custom image / URL modes paint once on apply and don't need a
+       periodic recompute. */
+    if (g_cfg.bg_mode == 0) sunmap_redraw();
+}
+
+#define CLOCK_BG_PATH "/sdcard/clock_bg.bin"
+
+/* Load a raw RGB565 image of size canvas_w*canvas_h*2 from the SD
+   card into the sunmap canvas buffer. The framebuffer uses the panel
+   byte order (LV_COLOR_16_SWAP) -- the caller must save the file in
+   that same byte order. Returns 0 on success. */
+static int clock_bg_load_raw(const char *path)
+{
+    if (!g_sunmap_buf || g_sunmap_w == 0) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "bg load: open %s failed", path);
+        return -1;
+    }
+    size_t need = (size_t)g_sunmap_w * g_sunmap_h * sizeof(uint16_t);
+    size_t got = fread(g_sunmap_buf, 1, need, f);
+    fclose(f);
+    if (got != need) {
+        ESP_LOGW(TAG, "bg load: short read %zu/%zu", got, need);
+        return -1;
+    }
+    if (g_sunmap_canvas) lv_obj_invalidate(g_sunmap_canvas);
+    return 0;
+}
+
+/* Apply the background mode: paint the canvas from whichever source
+   the user picked. Caller must hold the lvgl mutex. */
+extern "C" void clock_bg_apply(void)
+{
+    if (!g_sunmap_buf) return;
+    switch (g_cfg.bg_mode) {
+        case 1:
+            if (clock_bg_load_raw(CLOCK_BG_PATH) != 0) {
+                /* Fall back to sun map if the file is missing/short. */
+                sunmap_redraw();
+            }
+            break;
+        case 2:
+            /* URL mode paints whatever the fetcher last wrote. */
+            if (clock_bg_load_raw(CLOCK_BG_PATH) != 0) {
+                sunmap_redraw();
+            }
+            break;
+        default:
+            sunmap_redraw();
+            break;
+    }
+}
+
+/* HTTP fetcher for bg_mode=2 (URL). Runs on its own task; sleeps for
+   bg_refresh_s between fetches. Writes to CLOCK_BG_PATH then asks
+   LVGL to reload the canvas. */
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+
+static TaskHandle_t s_bg_fetcher = NULL;
+static volatile bool s_bg_fetcher_kick = false;
+
+static esp_err_t bg_fetch_once(const char *url)
+{
+    if (!sdcard_is_mounted()) return ESP_ERR_INVALID_STATE;
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.timeout_ms = 10000;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return ESP_FAIL;
+    esp_err_t e = esp_http_client_open(c, 0);
+    if (e != ESP_OK) { esp_http_client_cleanup(c); return e; }
+    int hl = esp_http_client_fetch_headers(c);
+    int status = esp_http_client_get_status_code(c);
+    if (status != 200) {
+        ESP_LOGW(TAG, "bg fetch %s -> HTTP %d (len=%d)", url, status, hl);
+        esp_http_client_close(c); esp_http_client_cleanup(c);
+        return ESP_FAIL;
+    }
+    /* Stream straight into a temp file then rename so a partial
+       response doesn't corrupt CLOCK_BG_PATH. */
+    char tmp[80];
+    snprintf(tmp, sizeof(tmp), "%s.part", CLOCK_BG_PATH);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { esp_http_client_close(c); esp_http_client_cleanup(c); return ESP_FAIL; }
+    char *buf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) { fclose(f); esp_http_client_close(c); esp_http_client_cleanup(c); return ESP_ERR_NO_MEM; }
+    int total = 0;
+    while (1) {
+        int n = esp_http_client_read(c, buf, 4096);
+        if (n <= 0) break;
+        if (fwrite(buf, 1, n, f) != (size_t)n) break;
+        total += n;
+    }
+    free(buf);
+    fclose(f);
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    size_t need = (size_t)canvas_w * canvas_h * 2;
+    if ((size_t)total != need) {
+        ESP_LOGW(TAG, "bg fetch: %d bytes, need %zu", total, need);
+        unlink(tmp);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    rename(tmp, CLOCK_BG_PATH);
+    ESP_LOGI(TAG, "bg fetched %d bytes from %s", total, url);
+    /* Repaint on the LVGL task. */
+    if (lvgl_lock(50)) { clock_bg_apply(); lvgl_unlock(); }
+    return ESP_OK;
+}
+
+static void bg_fetcher_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        /* Sleep until kicked or interval elapses. */
+        int wait_s = g_cfg.bg_refresh_s > 0 ? g_cfg.bg_refresh_s : 60;
+        for (int i = 0; i < wait_s * 10; i++) {
+            if (s_bg_fetcher_kick) { s_bg_fetcher_kick = false; break; }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            /* If user switched off URL mode, exit. */
+            if (g_cfg.bg_mode != 2) goto out;
+        }
+        if (g_cfg.bg_mode != 2 || !g_cfg.bg_url[0]) goto out;
+        bg_fetch_once(g_cfg.bg_url);
+    }
+out:
+    s_bg_fetcher = NULL;
+    vTaskDeleteWithCaps(NULL);
+}
+
+static void bg_fetcher_ensure(void)
+{
+    if (g_cfg.bg_mode != 2 || !g_cfg.bg_url[0]) return;
+    if (s_bg_fetcher) {
+        s_bg_fetcher_kick = true;   /* poke existing task */
+        return;
+    }
+    BaseType_t r = xTaskCreatePinnedToCoreWithCaps(
+        bg_fetcher_task, "bg_fetcher", 6 * 1024, NULL, 4, &s_bg_fetcher, 0,
+        MALLOC_CAP_SPIRAM);
+    if (r != pdPASS) {
+        ESP_LOGE(TAG, "bg fetcher task spawn failed");
+        s_bg_fetcher = NULL;
+    }
 }
 
 /* ---------------------- Radio tile ---------------------- */
@@ -3921,6 +4124,11 @@ extern "C" void app_main(void)
        engine), but the Hello tile is gone so that demo wasn't reachable
        anyway. */
     radio_engine_warm_at_boot();
+
+    /* If user picked URL background mode, spawn the fetcher. It
+       waits for Wi-Fi internally (esp_http_client just fails until
+       we associate, then succeeds on the next interval). */
+    bg_fetcher_ensure();
 
     /* Auto-connect at boot using whatever NVS has stored, unless the
        user disabled it in Settings. */

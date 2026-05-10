@@ -60,6 +60,15 @@ extern int  app_cfg_get_show_clock(void);
 extern void app_cfg_set_show_clock(int show);
 extern const char *app_cfg_get_clock_text(void);
 extern void app_cfg_set_clock_text(const char *s);
+extern int  app_cfg_get_bg_mode(void);
+extern int  app_cfg_get_bg_refresh_s(void);
+extern const char *app_cfg_get_bg_url(void);
+extern int  app_cfg_get_canvas_w(void);
+extern int  app_cfg_get_canvas_h(void);
+extern void app_cfg_set_bg_mode(int m);
+extern void app_cfg_set_bg_url(const char *url);
+extern void app_cfg_set_bg_refresh_s(int s);
+extern void app_cfg_clock_bg_reload(void);
 /* Snapshot the LCD framebuffer into the caller's buffer (RGB565,
    panel byte order). Returns bytes written or -1 on error. The
    snapshot is taken under the lvgl mutex so the BMP encoder doesn't
@@ -160,6 +169,17 @@ static const char k_index_html[] =
 " <div class=meta>x=<span id=ckxv>0</span> y=<span id=ckyv>0</span> (offset from center)</div>\n"
 " <button id=ckcenter>Center</button>\n"
 "</section>\n"
+"<section><h2>Background</h2>\n"
+" <label>mode</label>\n"
+" <select id=bgm><option value=0>Sun map</option><option value=1>Custom upload</option><option value=2>URL</option></select>\n"
+" <label>upload an image (any size; converted to <span id=bgwh>640x172</span> RGB565)</label>\n"
+" <input id=bgfile type=file accept='image/*'>\n"
+" <div id=bgstat class=meta></div>\n"
+" <label>URL (must serve raw RGB565 panel-byte-order, exactly <span id=bgsize>220160</span> bytes)</label>\n"
+" <input id=bgurl type=text style='width:100%;background:#111;color:#eee;border:1px solid #333;padding:6px;border-radius:4px' placeholder='https://example.com/bg.rgb565'>\n"
+" <label>refresh every (s, 0=once)</label>\n"
+" <input id=bgref type=number min=0 max=86400 value=0 style='width:120px'>\n"
+"</section>\n"
 "<section><h2>Settings</h2>\n"
 " <label>brightness: <span id=brl>?</span></label>\n"
 " <input id=br type=range min=0 max=255>\n"
@@ -192,6 +212,10 @@ static const char k_index_html[] =
 " document.getElementById('css').checked=!!s.show_seconds;\n"
 " document.getElementById('ckon').checked=s.show_clock!==0;\n"
 " if(document.activeElement!==document.getElementById('cktx'))document.getElementById('cktx').value=s.clock_text||'';\n"
+" if(document.activeElement!==document.getElementById('bgm'))document.getElementById('bgm').value=s.bg_mode||0;\n"
+" if(document.activeElement!==document.getElementById('bgurl'))document.getElementById('bgurl').value=s.bg_url||'';\n"
+" if(document.activeElement!==document.getElementById('bgref'))document.getElementById('bgref').value=s.bg_refresh_s||0;\n"
+" let cw=s.canvas_w||640,ch=s.canvas_h||172;document.getElementById('bgwh').textContent=cw+'x'+ch;document.getElementById('bgsize').textContent=cw*ch*2;\n"
 " let r=(s.clock_rgba>>>24)&0xff,g=(s.clock_rgba>>>16)&0xff,b=(s.clock_rgba>>>8)&0xff,a=s.clock_rgba&0xff;\n"
 " if(document.activeElement!==document.getElementById('ckc'))\n"
 "  document.getElementById('ckc').value='#'+[r,g,b].map(x=>x.toString(16).padStart(2,'0')).join('');\n"
@@ -236,6 +260,33 @@ static const char k_index_html[] =
 "document.getElementById('ckon').onchange=e=>pushClock({show_clock:e.target.checked?1:0});\n"
 "let txTimer;document.getElementById('cktx').oninput=e=>{clearTimeout(txTimer);txTimer=setTimeout(()=>pushClock({text:e.target.value}),250)};\n"
 "document.getElementById('ckcenter').onclick=()=>pushClock({x:0,y:0});\n"
+"function pushBg(o){let fd=new URLSearchParams();for(let k in o)fd.append(k,o[k]);fetch('/api/bg',{method:'POST',body:fd})}\n"
+"document.getElementById('bgm').onchange=e=>pushBg({mode:e.target.value});\n"
+"let bgUrlT;document.getElementById('bgurl').oninput=e=>{clearTimeout(bgUrlT);bgUrlT=setTimeout(()=>pushBg({url:e.target.value}),400)};\n"
+"document.getElementById('bgref').onchange=e=>pushBg({refresh_s:e.target.value});\n"
+/* Convert the picked image: load -> draw to a canvas of canvas_w x
+   canvas_h -> read pixels -> pack RGB565 -> byte-swap to panel order
+   -> POST to /api/bg/upload as raw binary. */
+"document.getElementById('bgfile').onchange=async e=>{\n"
+" let f=e.target.files[0];if(!f)return;\n"
+" let st=await fetch('/api/state').then(r=>r.json());\n"
+" let cw=st.canvas_w||640,ch=st.canvas_h||172;\n"
+" let img=new Image();img.src=URL.createObjectURL(f);\n"
+" await new Promise((res,rej)=>{img.onload=res;img.onerror=rej});\n"
+" let cv=document.createElement('canvas');cv.width=cw;cv.height=ch;\n"
+" cv.getContext('2d').drawImage(img,0,0,cw,ch);\n"
+" let id=cv.getContext('2d').getImageData(0,0,cw,ch).data;\n"
+" let out=new Uint8Array(cw*ch*2);\n"
+" for(let i=0,j=0;i<id.length;i+=4,j+=2){\n"
+"  let r=id[i]>>3,g=id[i+1]>>2,b=id[i+2]>>3;\n"
+"  let p=(r<<11)|(g<<5)|b;\n"
+   /* Panel uses LV_COLOR_16_SWAP (high byte first per pixel). */
+"  out[j]=(p>>8)&0xff;out[j+1]=p&0xff;\n"
+" }\n"
+" document.getElementById('bgstat').textContent='uploading '+out.length+' bytes...';\n"
+" let resp=await fetch('/api/bg/upload',{method:'POST',body:out,headers:{'Content-Type':'application/octet-stream'}});\n"
+" document.getElementById('bgstat').textContent=resp.ok?'uploaded -- pick \"Custom upload\" mode to display.':'upload failed: '+resp.status;\n"
+"};\n"
 "function rgbaFromInputs(){let h=document.getElementById('ckc').value;let r=parseInt(h.substr(1,2),16),g=parseInt(h.substr(3,2),16),b=parseInt(h.substr(5,2),16);let a=+document.getElementById('cka').value;return ((r<<24)|(g<<16)|(b<<8)|a)>>>0}\n"
 "document.getElementById('ckc').onchange=()=>pushClock({rgba:rgbaFromInputs()});\n"
 "document.getElementById('cka').oninput=e=>{document.getElementById('ckal').textContent=e.target.value;pushClock({rgba:rgbaFromInputs()})};\n"
@@ -284,26 +335,37 @@ static esp_err_t h_state(httpd_req_t *r)
     uint16_t pl = playing ? pl_out : pl_in;
     uint16_t pr = playing ? pr_out : pr_in;
 
-    /* Escape clock_text for JSON. clock_text is at most 39 bytes; the
-       worst case (every char a quote/backslash) doubles to ~80. */
+    /* Inline the JSON-escape twice (C, no closures) for clock_text
+       and bg_url. Strip control chars, escape " and \. */
     char ct_esc[96];
     {
         const char *s = app_cfg_get_clock_text();
         size_t o = 0;
-        while (*s && o < sizeof(ct_esc) - 2) {
+        while (s && *s && o < sizeof(ct_esc) - 2) {
             char c = *s++;
             if (c == '"' || c == '\\') {
                 if (o + 2 >= sizeof(ct_esc) - 1) break;
                 ct_esc[o++] = '\\';
-            } else if (c < 0x20) {
-                /* drop control chars */
-                continue;
-            }
+            } else if ((unsigned char)c < 0x20) continue;
             ct_esc[o++] = c;
         }
         ct_esc[o] = 0;
     }
-    char json[768];
+    char bgu_esc[256];
+    {
+        const char *s = app_cfg_get_bg_url();
+        size_t o = 0;
+        while (s && *s && o < sizeof(bgu_esc) - 2) {
+            char c = *s++;
+            if (c == '"' || c == '\\') {
+                if (o + 2 >= sizeof(bgu_esc) - 1) break;
+                bgu_esc[o++] = '\\';
+            } else if ((unsigned char)c < 0x20) continue;
+            bgu_esc[o++] = c;
+        }
+        bgu_esc[o] = 0;
+    }
+    char json[1024];
     int n = snprintf(json, sizeof(json),
         "{\"recording\":%d,\"elapsed\":%u,"
         "\"playing\":%d,\"uri\":\"%s\","
@@ -312,7 +374,8 @@ static esp_err_t h_state(httpd_req_t *r)
         "\"clock_x\":%d,\"clock_y\":%d,\"clock_size\":%d,"
         "\"clock_rgba\":%u,\"show_ms\":%d,\"show_seconds\":%d,"
         "\"show_clock\":%d,\"clock_text\":\"%s\","
-        "\"canvas_w\":640,\"canvas_h\":172}",
+        "\"bg_mode\":%d,\"bg_refresh_s\":%d,\"bg_url\":\"%s\","
+        "\"canvas_w\":%d,\"canvas_h\":%d}",
         (int)recording, recorder_elapsed_s(),
         (int)playing,   radio_current_uri() ? radio_current_uri() : "",
         (unsigned)pl, (unsigned)pr,
@@ -327,7 +390,12 @@ static esp_err_t h_state(httpd_req_t *r)
         app_cfg_get_show_ms(),
         app_cfg_get_show_seconds(),
         app_cfg_get_show_clock(),
-        ct_esc);
+        ct_esc,
+        app_cfg_get_bg_mode(),
+        app_cfg_get_bg_refresh_s(),
+        bgu_esc,
+        app_cfg_get_canvas_w(),
+        app_cfg_get_canvas_h());
     (void)n;
     return send_str(r, "application/json", json);
 }
@@ -453,6 +521,90 @@ static esp_err_t h_clock(httpd_req_t *r)
         dec[o] = 0;
         app_cfg_set_clock_text(dec);
     }
+    return send_str(r, "application/json", "{\"ok\":true}");
+}
+
+/* ---------- /api/bg ---------- */
+
+/* form keys: mode (0=sun,1=upload,2=url), url, refresh_s. */
+static esp_err_t h_bg(httpd_req_t *r)
+{
+    char body[400];
+    int n = read_body(r, body, sizeof(body));
+    if (n <= 0) return send_str(r, "text/plain", "empty");
+    if (strstr(body, "mode=")) {
+        app_cfg_set_bg_mode(form_int(body, "mode", 0));
+    }
+    if (strstr(body, "refresh_s=")) {
+        app_cfg_set_bg_refresh_s(form_int(body, "refresh_s", 0));
+    }
+    /* URL-decode the url field. Same naive parser as h_clock's text. */
+    const char *up = strstr(body, "url=");
+    if (up) {
+        up += 4;
+        char dec[180];
+        size_t o = 0;
+        while (*up && *up != '&' && o < sizeof(dec) - 1) {
+            char c = *up++;
+            if (c == '+') c = ' ';
+            else if (c == '%' && up[0] && up[1]) {
+                char hex[3] = { up[0], up[1], 0 };
+                c = (char)strtol(hex, NULL, 16);
+                up += 2;
+            }
+            dec[o++] = c;
+        }
+        dec[o] = 0;
+        app_cfg_set_bg_url(dec);
+    }
+    return send_str(r, "application/json", "{\"ok\":true}");
+}
+
+/* POST raw RGB565 pixels to be saved as the custom clock background.
+   Body must be exactly canvas_w*canvas_h*2 bytes. The uploader (the
+   webui page) is responsible for rendering the image to that
+   resolution and byte-swapping pixels for the panel. */
+#define CLOCK_BG_PATH_LOCAL "/sdcard/clock_bg.bin"
+static esp_err_t h_bg_upload(httpd_req_t *r)
+{
+    if (!sdcard_is_mounted()) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "sd not mounted");
+        return ESP_FAIL;
+    }
+    int need = app_cfg_get_canvas_w() * app_cfg_get_canvas_h() * 2;
+    if (r->content_len != (size_t)need) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "expect %d bytes (RGB565)", need);
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, msg);
+        return ESP_FAIL;
+    }
+    char tmp[80];
+    snprintf(tmp, sizeof(tmp), "%s.part", CLOCK_BG_PATH_LOCAL);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "open failed");
+        return ESP_FAIL;
+    }
+    char *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) { fclose(f); return ESP_FAIL; }
+    int got = 0;
+    while (got < need) {
+        int chunk = need - got > 4096 ? 4096 : need - got;
+        int rc = httpd_req_recv(r, buf, chunk);
+        if (rc <= 0) break;
+        if (fwrite(buf, 1, rc, f) != (size_t)rc) break;
+        got += rc;
+    }
+    free(buf);
+    fclose(f);
+    if (got != need) {
+        unlink(tmp);
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "short read");
+        return ESP_FAIL;
+    }
+    rename(tmp, CLOCK_BG_PATH_LOCAL);
+    /* If the user is currently in upload mode, repaint immediately. */
+    if (app_cfg_get_bg_mode() == 1) app_cfg_clock_bg_reload();
     return send_str(r, "application/json", "{\"ok\":true}");
 }
 
@@ -663,6 +815,8 @@ esp_err_t webui_start(void)
         { .uri = "/api/list",        .method = HTTP_GET,  .handler = h_list },
         { .uri = "/api/cfg",         .method = HTTP_POST, .handler = h_cfg },
         { .uri = "/api/clock",       .method = HTTP_POST, .handler = h_clock },
+        { .uri = "/api/bg",          .method = HTTP_POST, .handler = h_bg },
+        { .uri = "/api/bg/upload",   .method = HTTP_POST, .handler = h_bg_upload },
         { .uri = "/api/rec/start",   .method = HTTP_POST, .handler = h_rec_start },
         { .uri = "/api/rec/stop",    .method = HTTP_POST, .handler = h_rec_stop },
         { .uri = "/api/play",        .method = HTTP_POST, .handler = h_play },
