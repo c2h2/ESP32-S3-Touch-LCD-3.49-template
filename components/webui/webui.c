@@ -41,6 +41,11 @@
    doesn't need to include from main/. */
 extern void app_cfg_set_brightness(int v);
 extern void app_cfg_set_dim_off(int dim_s, int off_s);
+/* Snapshot the LCD framebuffer into the caller's buffer (RGB565,
+   panel byte order). Returns bytes written or -1 on error. The
+   snapshot is taken under the lvgl mutex so the BMP encoder doesn't
+   tear when LVGL flushes mid-read. */
+extern int  webui_snapshot_fb(void *out, size_t cap);
 
 static const char *TAG = "webui";
 
@@ -360,6 +365,22 @@ static esp_err_t h_screen_bmp(httpd_req_t *r)
     }
     int w = s_fb_w;
     int h = s_fb_h;
+    /* Snapshot under the LVGL mutex so the BMP encoder reads a stable
+       copy. Otherwise the framebuffer changes mid-encode and the
+       browser shows torn frames. */
+    size_t snap_bytes = (size_t)w * h * 2;
+    uint16_t *snap = heap_caps_malloc(snap_bytes,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!snap) {
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "snap oom");
+        return ESP_FAIL;
+    }
+    int got = webui_snapshot_fb(snap, snap_bytes);
+    if (got < 0) {
+        free(snap);
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "snap fail");
+        return ESP_FAIL;
+    }
     /* BMP rows must be padded to 4 bytes. RGB565 = 2 B/px, so 4 B padding
        hits when (w*2)%4 != 0. Use a per-row scratch. */
     int row_bytes = w * 2;
@@ -415,11 +436,12 @@ static esp_err_t h_screen_bmp(httpd_req_t *r)
        is in big-endian RGB565 (LV_COLOR_16_SWAP). */
     uint8_t *row = heap_caps_malloc(row_padded, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!row) {
+        free(snap);
         httpd_resp_send_chunk(r, NULL, 0);
         return ESP_FAIL;
     }
     memset(row, 0, row_padded);
-    const uint16_t *fb = (const uint16_t *)s_fb;
+    const uint16_t *fb = snap;
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             uint16_t v = fb[y * w + x];
@@ -433,6 +455,7 @@ static esp_err_t h_screen_bmp(httpd_req_t *r)
         }
     }
     free(row);
+    free(snap);
     httpd_resp_send_chunk(r, NULL, 0);
     return ESP_OK;
 }

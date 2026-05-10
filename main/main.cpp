@@ -1019,6 +1019,32 @@ static void wifi_connect(const char *ssid, const char *pass)
 
 /* Public language getters/setters used by i18n.c. Defined here because
    g_cfg is otherwise file-static. */
+/* For the webui /screen.bmp endpoint: snapshot the current framebuffer
+   into the caller's buffer under the lvgl mutex, so the encoder reads
+   a stable copy instead of fighting the panel flush mid-write. */
+extern "C" int webui_snapshot_fb(void *out, size_t cap);
+extern "C" int webui_snapshot_fb(void *out, size_t cap)
+{
+    extern uint16_t *lvgl_dma_bufs[2];   /* unused but documents intent */
+    (void)lvgl_dma_bufs;
+    /* The framebuffer is the same buffer LVGL hands to the panel via
+       flush_cb. Reading it under the mutex blocks LVGL from rendering
+       a new frame for ~6 ms (one memcpy of 220 KB at PSRAM speed). */
+    if (!out) return -1;
+    size_t need = (size_t)UI_CANVAS_W * UI_CANVAS_H * 2;
+    if (cap < need) return -1;
+    /* The fb1 pointer was captured by webui_set_framebuffer at init.
+       We re-grab it here from the LVGL display driver. */
+    lv_disp_t *disp = lv_disp_get_default();
+    if (!disp || !disp->driver || !disp->driver->draw_buf) return -1;
+    const void *src = disp->driver->draw_buf->buf1;
+    if (!src) return -1;
+    if (!lvgl_lock(50)) return -1;
+    memcpy(out, src, need);
+    lvgl_unlock();
+    return (int)need;
+}
+
 extern "C" int  app_cfg_get_lang(void) { return g_cfg.lang; }
 extern "C" void app_cfg_set_lang(int lang)
 {
