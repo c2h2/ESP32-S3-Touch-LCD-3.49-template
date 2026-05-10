@@ -56,6 +56,10 @@ extern void app_cfg_set_clock_rgba(uint32_t rgba);
 extern void app_cfg_set_show_ms(int show);
 extern int  app_cfg_get_show_seconds(void);
 extern void app_cfg_set_show_seconds(int show);
+extern int  app_cfg_get_show_clock(void);
+extern void app_cfg_set_show_clock(int show);
+extern const char *app_cfg_get_clock_text(void);
+extern void app_cfg_set_clock_text(const char *s);
 /* Snapshot the LCD framebuffer into the caller's buffer (RGB565,
    panel byte order). Returns bytes written or -1 on error. The
    snapshot is taken under the lvgl mutex so the BMP encoder doesn't
@@ -135,6 +139,10 @@ static const char k_index_html[] =
 " <input id=rr type=range min=0.5 max=10 step=0.5 value=1>\n"
 "</section>\n"
 "<section><h2>Clock</h2>\n"
+" <label>show clock</label>\n"
+" <input id=ckon type=checkbox>\n"
+" <label>custom text (empty = use the time)</label>\n"
+" <input id=cktx type=text maxlength=39 placeholder='e.g. Hello' style='width:100%;background:#111;color:#eee;border:1px solid #333;padding:6px;border-radius:4px'>\n"
 " <label>size</label>\n"
 " <select id=cks><option value=0>XS</option><option value=1>S</option><option value=2>M</option><option value=3 selected>L</option></select>\n"
 " <label>show seconds</label>\n"
@@ -182,6 +190,8 @@ static const char k_index_html[] =
 " if(document.activeElement!==document.getElementById('cks'))document.getElementById('cks').value=s.clock_size;\n"
 " document.getElementById('cms').checked=!!s.show_ms;\n"
 " document.getElementById('css').checked=!!s.show_seconds;\n"
+" document.getElementById('ckon').checked=s.show_clock!==0;\n"
+" if(document.activeElement!==document.getElementById('cktx'))document.getElementById('cktx').value=s.clock_text||'';\n"
 " let r=(s.clock_rgba>>>24)&0xff,g=(s.clock_rgba>>>16)&0xff,b=(s.clock_rgba>>>8)&0xff,a=s.clock_rgba&0xff;\n"
 " if(document.activeElement!==document.getElementById('ckc'))\n"
 "  document.getElementById('ckc').value='#'+[r,g,b].map(x=>x.toString(16).padStart(2,'0')).join('');\n"
@@ -223,6 +233,8 @@ static const char k_index_html[] =
 "document.getElementById('cks').onchange=e=>pushClock({size:e.target.value});\n"
 "document.getElementById('cms').onchange=e=>pushClock({show_ms:e.target.checked?1:0});\n"
 "document.getElementById('css').onchange=e=>pushClock({show_seconds:e.target.checked?1:0});\n"
+"document.getElementById('ckon').onchange=e=>pushClock({show_clock:e.target.checked?1:0});\n"
+"let txTimer;document.getElementById('cktx').oninput=e=>{clearTimeout(txTimer);txTimer=setTimeout(()=>pushClock({text:e.target.value}),250)};\n"
 "document.getElementById('ckcenter').onclick=()=>pushClock({x:0,y:0});\n"
 "function rgbaFromInputs(){let h=document.getElementById('ckc').value;let r=parseInt(h.substr(1,2),16),g=parseInt(h.substr(3,2),16),b=parseInt(h.substr(5,2),16);let a=+document.getElementById('cka').value;return ((r<<24)|(g<<16)|(b<<8)|a)>>>0}\n"
 "document.getElementById('ckc').onchange=()=>pushClock({rgba:rgbaFromInputs()});\n"
@@ -272,7 +284,26 @@ static esp_err_t h_state(httpd_req_t *r)
     uint16_t pl = playing ? pl_out : pl_in;
     uint16_t pr = playing ? pr_out : pr_in;
 
-    char json[640];
+    /* Escape clock_text for JSON. clock_text is at most 39 bytes; the
+       worst case (every char a quote/backslash) doubles to ~80. */
+    char ct_esc[96];
+    {
+        const char *s = app_cfg_get_clock_text();
+        size_t o = 0;
+        while (*s && o < sizeof(ct_esc) - 2) {
+            char c = *s++;
+            if (c == '"' || c == '\\') {
+                if (o + 2 >= sizeof(ct_esc) - 1) break;
+                ct_esc[o++] = '\\';
+            } else if (c < 0x20) {
+                /* drop control chars */
+                continue;
+            }
+            ct_esc[o++] = c;
+        }
+        ct_esc[o] = 0;
+    }
+    char json[768];
     int n = snprintf(json, sizeof(json),
         "{\"recording\":%d,\"elapsed\":%u,"
         "\"playing\":%d,\"uri\":\"%s\","
@@ -280,6 +311,7 @@ static esp_err_t h_state(httpd_req_t *r)
         "\"brightness\":%d,\"volume\":%d,\"dim_s\":%d,\"off_s\":%d,"
         "\"clock_x\":%d,\"clock_y\":%d,\"clock_size\":%d,"
         "\"clock_rgba\":%u,\"show_ms\":%d,\"show_seconds\":%d,"
+        "\"show_clock\":%d,\"clock_text\":\"%s\","
         "\"canvas_w\":640,\"canvas_h\":172}",
         (int)recording, recorder_elapsed_s(),
         (int)playing,   radio_current_uri() ? radio_current_uri() : "",
@@ -293,7 +325,9 @@ static esp_err_t h_state(httpd_req_t *r)
         app_cfg_get_clock_size(),
         (unsigned)app_cfg_get_clock_rgba(),
         app_cfg_get_show_ms(),
-        app_cfg_get_show_seconds());
+        app_cfg_get_show_seconds(),
+        app_cfg_get_show_clock(),
+        ct_esc);
     (void)n;
     return send_str(r, "application/json", json);
 }
@@ -395,6 +429,29 @@ static esp_err_t h_clock(httpd_req_t *r)
     }
     if (strstr(body, "show_seconds=")) {
         app_cfg_set_show_seconds(form_int(body, "show_seconds", 1));
+    }
+    if (strstr(body, "show_clock=")) {
+        app_cfg_set_show_clock(form_int(body, "show_clock", 1));
+    }
+    /* URL-decoded custom text. body parser is naive: find "text=",
+       copy until '&' or end, %XX-decode and '+' -> ' '. */
+    const char *tp = strstr(body, "text=");
+    if (tp) {
+        tp += 5;
+        char dec[64];
+        size_t o = 0;
+        while (*tp && *tp != '&' && o < sizeof(dec) - 1) {
+            char c = *tp++;
+            if (c == '+') c = ' ';
+            else if (c == '%' && tp[0] && tp[1]) {
+                char hex[3] = { tp[0], tp[1], 0 };
+                c = (char)strtol(hex, NULL, 16);
+                tp += 2;
+            }
+            dec[o++] = c;
+        }
+        dec[o] = 0;
+        app_cfg_set_clock_text(dec);
     }
     return send_str(r, "application/json", "{\"ok\":true}");
 }

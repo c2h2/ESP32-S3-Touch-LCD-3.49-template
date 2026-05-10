@@ -105,6 +105,8 @@ typedef struct {
     int16_t  clock_y;
     uint8_t  clock_size;       /* 0..3 */
     uint32_t clock_rgba;       /* 0xRRGGBBAA */
+    uint8_t  show_clock;       /* 1 = render the time face; 0 = sun map only */
+    char     clock_text[40];   /* if non-empty: render this string in place of HH:MM */
 } app_cfg_t;
 
 static app_cfg_t g_cfg = {
@@ -127,6 +129,8 @@ static app_cfg_t g_cfg = {
     .clock_y          = 0,
     .clock_size       = 3,      /* L = jbmono_96 */
     .clock_rgba       = 0xFFFFFFFF,  /* white opaque */
+    .show_clock       = 1,
+    .clock_text       = {0},
 };
 
 static void cfg_load(void);
@@ -770,8 +774,13 @@ static void cfg_load(void)
     nvs_get_i16(h, "clk_y",   &cy);
     nvs_get_u8 (h, "clk_sz",  &cs);
     nvs_get_u32(h, "clk_rgba",&crgba);
+    uint8_t shc = g_cfg.show_clock;
+    nvs_get_u8 (h, "clk_show",&shc);
+    size_t ctl = sizeof(g_cfg.clock_text);
+    nvs_get_str(h, "clk_text",g_cfg.clock_text, &ctl);
     nvs_get_str(h, "last_ssid", g_cfg.last_ssid, &sl);
     nvs_close(h);
+    g_cfg.show_clock = shc ? 1 : 0;
     if (tzi >= TZ_CITY_COUNT) tzi = TZ_DEFAULT_CITY_INDEX;
     if (df > 2)  df  = 0;
     if (th > 2)  th  = 0;
@@ -839,6 +848,8 @@ static void cfg_save(void)
     nvs_set_i16(h, "clk_y",     g_cfg.clock_y);
     nvs_set_u8 (h, "clk_sz",    g_cfg.clock_size);
     nvs_set_u32(h, "clk_rgba",  g_cfg.clock_rgba);
+    nvs_set_u8 (h, "clk_show",  g_cfg.show_clock);
+    nvs_set_str(h, "clk_text",  g_cfg.clock_text);
     nvs_set_str(h, "last_ssid", g_cfg.last_ssid);
     nvs_commit(h);
     nvs_close(h);
@@ -1099,6 +1110,28 @@ extern "C" void app_cfg_set_show_seconds(int show)
     cfg_save();
     /* The clock_update_cb reads show_seconds each tick; no relayout
        needed because the time label width changes naturally. */
+}
+extern "C" int  app_cfg_get_show_clock(void) { return g_cfg.show_clock; }
+extern "C" void app_cfg_set_show_clock(int show)
+{
+    g_cfg.show_clock = show ? 1 : 0;
+    if (lvgl_lock(50)) { clock_apply_layout(); lvgl_unlock(); }
+    cfg_save();
+}
+extern "C" const char *app_cfg_get_clock_text(void) { return g_cfg.clock_text; }
+extern "C" void app_cfg_set_clock_text(const char *s)
+{
+    if (!s) s = "";
+    strncpy(g_cfg.clock_text, s, sizeof(g_cfg.clock_text) - 1);
+    g_cfg.clock_text[sizeof(g_cfg.clock_text) - 1] = 0;
+    if (lvgl_lock(50)) {
+        if (g_cfg.clock_text[0] && g_clock_time_label) {
+            lv_label_set_text(g_clock_time_label, g_cfg.clock_text);
+        }
+        clock_apply_layout();
+        lvgl_unlock();
+    }
+    cfg_save();
 }
 extern "C" void app_cfg_set_clock_pos(int x, int y)
 {
@@ -1407,7 +1440,10 @@ static void clock_ms_update_cb(lv_timer_t *t)
 {
     (void)t;
     if (!g_clock_ms_label) return;
-    if (!g_cfg.show_ms) {
+    /* Hide ms when the whole clock is off, when a custom text is set
+       (the .mmm field doesn't apply to "Hello world"), or when show_ms
+       is disabled. */
+    if (!g_cfg.show_clock || g_cfg.clock_text[0] || !g_cfg.show_ms) {
         if (!lv_obj_has_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN))
             lv_obj_add_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -1428,6 +1464,20 @@ static void clock_update_cb(lv_timer_t *t)
 {
     (void)t;
     if (!g_clock_time_label || !g_clock_date_label) return;
+    /* If the user hid the clock entirely, hide the time label and
+       let the sun map fill the tile. The date and tz labels stay
+       (they're separate widgets). */
+    if (!g_cfg.show_clock) {
+        if (!lv_obj_has_flag(g_clock_time_label, LV_OBJ_FLAG_HIDDEN))
+            lv_obj_add_flag(g_clock_time_label, LV_OBJ_FLAG_HIDDEN);
+    } else if (lv_obj_has_flag(g_clock_time_label, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_clear_flag(g_clock_time_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    /* If a custom text is set, show that instead of the time digits.
+       The date label still updates so the user keeps the calendar. */
+    if (g_cfg.clock_text[0]) {
+        lv_label_set_text(g_clock_time_label, g_cfg.clock_text);
+    }
     struct tm tm;
     get_display_time(&tm);
     char buf[64];
@@ -1458,12 +1508,14 @@ static void clock_update_cb(lv_timer_t *t)
         disp_h = hh % 12;
         if (disp_h == 0) disp_h = 12;
     }
-    if (g_cfg.show_seconds) {
-        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", disp_h, mi, ss);
-    } else {
-        snprintf(buf, sizeof(buf), "%02d:%02d",       disp_h, mi);
+    if (!g_cfg.clock_text[0]) {
+        if (g_cfg.show_seconds) {
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d", disp_h, mi, ss);
+        } else {
+            snprintf(buf, sizeof(buf), "%02d:%02d",       disp_h, mi);
+        }
+        lv_label_set_text(g_clock_time_label, buf);
     }
-    lv_label_set_text(g_clock_time_label, buf);
 }
 
 /* Forward decl: sunmap functions used by clock tile. */
@@ -1489,6 +1541,13 @@ static const lv_font_t *clock_size_to_font(uint8_t size)
 static void clock_apply_layout(void)
 {
     if (!g_clock_time_label || !g_clock_ms_label) return;
+    /* show_clock=0 hides the whole face; the sun map keeps drawing. */
+    if (!g_cfg.show_clock) {
+        lv_obj_add_flag(g_clock_time_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_clock_ms_label,   LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(g_clock_time_label, LV_OBJ_FLAG_HIDDEN);
     const lv_font_t *time_font = clock_size_to_font(g_cfg.clock_size);
     /* ms font is one tier smaller than the time, clamped at 12. */
     const lv_font_t *ms_font = clock_size_to_font(
@@ -1516,22 +1575,19 @@ static void clock_apply_layout(void)
     lv_obj_set_style_text_color(g_clock_ms_label, ms_col, 0);
     lv_obj_set_style_text_opa(g_clock_ms_label, aa ? aa : 0xFF, 0);
 
-    /* Position. When the ms is hidden, the time goes dead-center on
-       (clock_x, clock_y). When shown, shift the time left by half the
-       ms label's width so the combined "HH:MM:SS.mmm" is centered. */
-    if (g_cfg.show_ms) {
-        lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER,
-                     g_cfg.clock_x, g_cfg.clock_y);
+    /* Position. ms field gets a slot to the right of the time label
+       only when (a) we're showing the time digits (no custom text)
+       and (b) show_ms is on. Otherwise the time label centers on
+       (clock_x, clock_y) by itself. */
+    bool showing_ms = g_cfg.show_ms && !g_cfg.clock_text[0];
+    lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER,
+                 g_cfg.clock_x, g_cfg.clock_y);
+    if (showing_ms) {
         lv_obj_align_to(g_clock_ms_label, g_clock_time_label,
                         LV_ALIGN_OUT_RIGHT_BOTTOM, 0,
                         g_cfg.clock_size >= 3 ? -8 : -2);
         lv_obj_clear_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN);
     } else {
-        /* Pure-center the time at (clock_x, clock_y). The ms label is
-           hidden by clock_update_cb when show_ms is 0; we hide here
-           too in case layout was applied without a tick first. */
-        lv_obj_align(g_clock_time_label, LV_ALIGN_CENTER,
-                     g_cfg.clock_x, g_cfg.clock_y);
         lv_obj_add_flag(g_clock_ms_label, LV_OBJ_FLAG_HIDDEN);
     }
 }
