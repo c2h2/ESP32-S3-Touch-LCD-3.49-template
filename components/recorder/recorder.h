@@ -37,6 +37,12 @@ void        recorder_full_path(char *out, size_t cap, const char *name);
 /* Delete a file under /sdcard/recordings/<name>. */
 esp_err_t   recorder_delete(const char *name);
 
+/* Get file size in bytes and playback duration in ms for a recording.
+   Computes duration from raw PCM size assuming 44.1k stereo 16-bit
+   (the format the recorder writes). */
+esp_err_t   recorder_file_info(const char *name, uint32_t *out_bytes,
+                               uint32_t *out_duration_ms);
+
 /* Peak absolute sample (max of L/R) since the last call. Reading
    resets the internal peaks. */
 #include <stdint.h>

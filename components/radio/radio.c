@@ -42,6 +42,7 @@ static const audio_codec_if_t *s_codec_if   = NULL;       /* shared, single ES83
 static esp_asp_handle_t        s_player     = NULL;
 static volatile esp_asp_state_t s_state     = ESP_ASP_STATE_NONE;
 static int                     s_cur_idx    = -1;
+static char                    s_cur_uri[256] = {0};
 static int                     s_volume     = 70;  /* 0..100 */
 static uint32_t                s_cur_rate   = 44100;  /* last codec_dev_open sample rate */
 static uint8_t                 s_cur_bits   = 16;
@@ -164,11 +165,15 @@ esp_err_t radio_init(void)
     s_data_if_in = audio_codec_new_i2s_data(&i2s_cfg_rx);
     if (!s_data_if_in) { ESP_LOGE(TAG, "i2s data create (rx) failed"); return ESP_FAIL; }
 
-    ESP_LOGI(TAG, "init step 5/8: es8311_codec_new (DAC, recorder will reuse for ADC)");
+    ESP_LOGI(TAG, "init step 5/8: es8311_codec_new (DAC only)");
+    /* ES8311 is wired as the OUTPUT codec on this board. The mic input
+       is on a separate ES7210 chip (the recorder owns that). Setting
+       WORK_MODE_BOTH here mutes the DAC output on this hardware --
+       audio playback was silent until we switched back to DAC. */
     es8311_codec_cfg_t es_cfg = {
         .ctrl_if   = s_ctrl_if,
         .gpio_if   = audio_codec_new_gpio(),
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
         .master_mode = false,
         .use_mclk  = true,
     };
@@ -258,7 +263,16 @@ esp_err_t radio_play(const char *uri)
     codec_drain_silence();
     ESP_LOGI(TAG, "play: %s", uri);
     esp_gmf_err_t err = esp_audio_simple_player_run(s_player, uri, NULL);
+    if (err == ESP_OK) {
+        strncpy(s_cur_uri, uri, sizeof(s_cur_uri) - 1);
+        s_cur_uri[sizeof(s_cur_uri) - 1] = 0;
+    }
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+const char *radio_current_uri(void)
+{
+    return s_cur_uri[0] ? s_cur_uri : NULL;
 }
 
 esp_err_t radio_stop(void)
@@ -318,6 +332,51 @@ void radio_set_volume(int v)
 }
 
 int radio_get_volume(void) { return s_volume; }
+
+void radio_beep(void)
+{
+    if (!s_codec) return;
+    /* 1 second of 880 Hz square wave at the codec's current 44.1 kHz
+       stereo / 16-bit format. Direct esp_codec_dev_write so we don't
+       go through the simple_player pipeline -- this isolates "is the
+       DAC + speaker chain alive?" from "does file decode work?" */
+    int rate = 44100;
+    int n_frames = rate;                  /* 1.0 s at 44.1 kHz */
+    int half_period = rate / 880 / 2;     /* samples per half period */
+    int amp = 8000;
+    int chunk_frames = 256;
+    int16_t buf[256 * 2];
+    int hi = 1;
+    int phase = 0;
+    /* Push at full volume during the beep, then restore. */
+    int saved_vol = s_volume;
+    esp_codec_dev_set_out_vol(s_codec, 70);
+    int written = 0;
+    while (written < n_frames) {
+        int this_n = (n_frames - written < chunk_frames) ? (n_frames - written) : chunk_frames;
+        for (int i = 0; i < this_n; i++) {
+            int16_t s = hi ? amp : -amp;
+            buf[2 * i]     = s;
+            buf[2 * i + 1] = s;
+            if (++phase >= half_period) { phase = 0; hi = !hi; }
+        }
+        esp_codec_dev_write(s_codec, buf, this_n * 2 * sizeof(int16_t));
+        written += this_n;
+    }
+    /* Flush DMA with silence so the codec doesn't keep repeating the
+       last buffer of square wave (the I2S DMA ring would otherwise
+       loop on stale tone samples). ~100 ms of zeros covers the 6 DMA
+       descriptors x 240 frames buffered ahead. */
+    memset(buf, 0, sizeof(buf));
+    int silence_frames = rate / 10;
+    int s_written = 0;
+    while (s_written < silence_frames) {
+        int this_n = (silence_frames - s_written < chunk_frames) ? (silence_frames - s_written) : chunk_frames;
+        esp_codec_dev_write(s_codec, buf, this_n * 2 * sizeof(int16_t));
+        s_written += this_n;
+    }
+    esp_codec_dev_set_out_vol(s_codec, saved_vol);
+}
 
 void *radio_get_i2s_rx_handle(void)     { return (void *)s_i2s_rx; }
 void *radio_get_codec_ctrl_if(void)     { return (void *)s_ctrl_if; }

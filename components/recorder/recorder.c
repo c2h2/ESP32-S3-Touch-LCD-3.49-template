@@ -64,6 +64,11 @@ static TaskHandle_t             s_worker     = NULL;
    Stereo capture, two channels interleaved (L, R, L, R...). */
 static volatile uint16_t        s_peak_l     = 0;
 static volatile uint16_t        s_peak_r     = 0;
+/* Playback state we paused so we can resume on rec_stop. radio_play
+   parks the URL string in radio.c; this just remembers whether
+   playback was active when we started recording. */
+static bool                     s_paused_pb_was_playing = false;
+static char                     s_paused_pb_uri[256] = {0};
 
 static esp_err_t worker_spawn(void);
 
@@ -214,6 +219,23 @@ esp_err_t recorder_start(const char **out_path)
         if (er != ESP_OK) return er;
     }
 
+    /* If the radio engine is currently playing something (radio stream
+       or a previously played recording), pause it so the new recording
+       isn't bleeding the speaker output back into the mic. Save the
+       URI so we can resume on rec_stop. */
+    s_paused_pb_was_playing = false;
+    s_paused_pb_uri[0] = 0;
+    if (radio_is_playing()) {
+        const char *u = radio_current_uri();
+        if (u) {
+            strncpy(s_paused_pb_uri, u, sizeof(s_paused_pb_uri) - 1);
+            s_paused_pb_uri[sizeof(s_paused_pb_uri) - 1] = 0;
+            s_paused_pb_was_playing = true;
+            ESP_LOGI(TAG, "pausing playback for recording: %s", s_paused_pb_uri);
+        }
+        radio_stop();
+    }
+
     /* Build a path with a wall-clock stamp so files sort sensibly. */
     time_t now = time(NULL);
     struct tm tm; localtime_r(&now, &tm);
@@ -297,6 +319,13 @@ esp_err_t recorder_stop(void)
         s_fp = NULL;
     }
     ESP_LOGI(TAG, "stopped, %lu bytes pcm", (unsigned long)s_pcm_bytes);
+    /* Resume whatever was playing before recording started. */
+    if (s_paused_pb_was_playing && s_paused_pb_uri[0]) {
+        ESP_LOGI(TAG, "resuming playback: %s", s_paused_pb_uri);
+        radio_play(s_paused_pb_uri);
+        s_paused_pb_was_playing = false;
+        s_paused_pb_uri[0] = 0;
+    }
     return ESP_OK;
 }
 
@@ -352,6 +381,26 @@ esp_err_t recorder_delete(const char *name)
     char p[96];
     recorder_full_path(p, sizeof(p), name);
     return (remove(p) == 0) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t recorder_file_info(const char *name, uint32_t *out_bytes,
+                             uint32_t *out_duration_ms)
+{
+    if (!sdcard_is_mounted()) return ESP_ERR_INVALID_STATE;
+    char p[96];
+    recorder_full_path(p, sizeof(p), name);
+    struct stat st;
+    if (stat(p, &st) != 0) return ESP_FAIL;
+    uint32_t bytes = (uint32_t)st.st_size;
+    if (out_bytes) *out_bytes = bytes;
+    if (out_duration_ms) {
+        /* Strip the 44-byte WAV header, then compute ms.
+           Bytes/sec = REC_RATE * REC_CHANNELS * (REC_BITS/8) = 176400. */
+        uint32_t pcm = (bytes > 44) ? (bytes - 44) : 0;
+        uint64_t bps = (uint64_t)REC_RATE * REC_CHANNELS * (REC_BITS / 8);
+        *out_duration_ms = bps ? (uint32_t)(((uint64_t)pcm * 1000) / bps) : 0;
+    }
+    return ESP_OK;
 }
 
 uint16_t recorder_peak_level(void)

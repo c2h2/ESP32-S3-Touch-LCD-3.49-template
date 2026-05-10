@@ -11,6 +11,10 @@ extern "C" {
    Must be called *after* audio_min_shutdown() so the I2S/codec is free. */
 esp_err_t radio_init(void);
 
+/* Play a short ~300 ms beep through the DAC so the user can hear that
+   speaker output works independent of any decoder/file path. */
+void      radio_beep(void);
+
 /* Start playing a URI. The player auto-detects MP3/AAC/FLAC/etc.
    For HTTPS streams the IDF default cert bundle must be enabled. */
 esp_err_t radio_play(const char *uri);
@@ -32,6 +36,10 @@ esp_err_t    radio_play_index(int idx);
 
 /* Index of the most recently requested station, -1 if none yet. */
 int          radio_current_index(void);
+
+/* Last URI handed to radio_play (NULL if never). Stays set across
+   radio_stop so callers can resume by passing it back to radio_play. */
+const char  *radio_current_uri(void);
 
 /* Output volume 0..100. Applied through the ES8311 codec, so it's a real
    analog gain change (not just a digital scale). */

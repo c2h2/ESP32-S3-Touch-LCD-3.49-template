@@ -2957,12 +2957,13 @@ static void recorder_refresh_list(void);
 
 static void rec_play_cb(lv_event_t *e)
 {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_CLICKED) return;
     if (menu_input_blocked()) return;
     const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name || !*name) return;
     char path[128];
     snprintf(path, sizeof(path), "file://sdcard/recordings/%s", name);
-    /* Stop the radio if it's playing, then hand the URI to the same
-       engine. simple_player decodes .wav natively. */
     if (radio_is_playing()) radio_stop();
     radio_play(path);
 }
@@ -2989,37 +2990,55 @@ static void recorder_refresh_list(void)
         return;
     }
     for (int i = 0; i < n; i++) {
-        lv_obj_t *row = lv_obj_create(g_rec_list);
-        lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, lv_pct(100), 24);
-        lv_obj_set_layout(row, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        /* Tappable row: tap row body = play; tap trash = delete.
+           Filename on the left (big), size/duration beneath (small),
+           trash icon on the right. Whole row is itself the click
+           target so the touch target is huge and we don't fight LVGL
+           about which child eats the click. */
+        lv_obj_t *row = lv_btn_create(g_rec_list);
+        lv_obj_set_size(row, lv_pct(100), 48);
+        lv_obj_set_style_bg_color(row, lv_color_make(0x18, 0x40, 0x28), 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *play = lv_btn_create(row);
-        lv_obj_set_size(play, 28, 22);
-        lv_obj_set_style_bg_color(play, lv_color_make(0x20, 0x80, 0x40), 0);
-        lv_obj_t *pl = lv_label_create(play);
-        lv_label_set_text(pl, LV_SYMBOL_PLAY);
-        lv_obj_set_style_text_color(pl, lv_color_white(), 0);
-        lv_obj_center(pl);
-        lv_obj_add_event_cb(play, rec_play_cb, LV_EVENT_CLICKED,
+        lv_obj_add_event_cb(row, rec_play_cb, LV_EVENT_CLICKED,
                             (void *)names[i]);
 
         lv_obj_t *name = lv_label_create(row);
         lv_label_set_text(name, names[i]);
         lv_obj_set_style_text_color(name, lv_color_white(), 0);
-        lv_obj_set_style_text_font(name, i18n_font(), 0);
-        lv_obj_set_flex_grow(name, 1);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+        lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, 0);
 
+        lv_obj_t *meta = lv_label_create(row);
+        uint32_t bytes = 0, dur_ms = 0;
+        recorder_file_info(names[i], &bytes, &dur_ms);
+        char meta_buf[48];
+        if (bytes >= 1024 * 1024) {
+            snprintf(meta_buf, sizeof(meta_buf), "%.1f MB  %u.%01us",
+                     bytes / (1024.0 * 1024.0),
+                     (unsigned)(dur_ms / 1000),
+                     (unsigned)((dur_ms / 100) % 10));
+        } else {
+            snprintf(meta_buf, sizeof(meta_buf), "%u KB  %u.%01us",
+                     (unsigned)(bytes / 1024),
+                     (unsigned)(dur_ms / 1000),
+                     (unsigned)((dur_ms / 100) % 10));
+        }
+        lv_label_set_text(meta, meta_buf);
+        lv_obj_set_style_text_color(meta, lv_color_make(0xc0, 0xc0, 0xc0), 0);
+        lv_obj_set_style_text_font(meta, &lv_font_montserrat_12, 0);
+        lv_obj_align(meta, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+        /* Trash button: anchored right, eats its own click event so the
+           row's play handler doesn't also fire on delete. */
         lv_obj_t *del = lv_btn_create(row);
-        lv_obj_set_size(del, 28, 22);
+        lv_obj_set_size(del, 40, 32);
+        lv_obj_align(del, LV_ALIGN_RIGHT_MID, 0, 0);
         lv_obj_set_style_bg_color(del, lv_color_make(0x80, 0x40, 0x20), 0);
         lv_obj_t *dl = lv_label_create(del);
         lv_label_set_text(dl, LV_SYMBOL_TRASH);
         lv_obj_set_style_text_color(dl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(dl, &lv_font_montserrat_16, 0);
         lv_obj_center(dl);
         lv_obj_add_event_cb(del, rec_delete_cb, LV_EVENT_CLICKED,
                             (void *)names[i]);
@@ -3106,13 +3125,14 @@ static void rec_list_open_cb(lv_event_t *e)
 {
     (void)e;
     if (menu_input_blocked()) return;
-    if (g_rec_list_overlay || !g_rec_tile) return;
-    /* Full-tile overlay: created on top of the recorder tile, deleted
-       on Back. Same parent so swipe gestures still travel back through
-       the tileview. */
-    g_rec_list_overlay = lv_obj_create(g_rec_tile);
+    if (g_rec_list_overlay) return;
+    /* Mount the overlay on the active screen's TOP LAYER so the
+       tileview can't capture our taps as start-of-swipe gestures.
+       Top layer is above the tileview in the input dispatch order. */
+    g_rec_list_overlay = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(g_rec_list_overlay);
-    lv_obj_set_size(g_rec_list_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_size(g_rec_list_overlay, canvas_w, canvas_h);
+    lv_obj_align(g_rec_list_overlay, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_color(g_rec_list_overlay, lv_color_make(0x10, 0x10, 0x18), 0);
     lv_obj_set_style_bg_opa(g_rec_list_overlay, LV_OPA_COVER, 0);
     lv_obj_clear_flag(g_rec_list_overlay, LV_OBJ_FLAG_SCROLLABLE);
@@ -3192,7 +3212,10 @@ static void build_recorder_tile(lv_obj_t *parent)
     g_rec_btn_lbl = lv_label_create(btn);
     lv_label_set_text(g_rec_btn_lbl, "REC");
     lv_obj_set_style_text_color(g_rec_btn_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(g_rec_btn_lbl, i18n_font(), 0);
+    /* User asked for 2x bigger than the default i18n font (~14 px).
+       Only Montserrat 12/14/16/48 are compiled in this build, so 48 is
+       the closest "much bigger". */
+    lv_obj_set_style_text_font(g_rec_btn_lbl, &lv_font_montserrat_48, 0);
     lv_obj_center(g_rec_btn_lbl);
 
     /* Right side: stereo L/R VU stacked vertically.
