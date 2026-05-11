@@ -1270,6 +1270,14 @@ extern "C" void app_cfg_clock_bg_reload(void)
 {
     if (lvgl_lock(50)) { clock_bg_apply(); lvgl_unlock(); }
 }
+/* Manual "fetch now" trigger for the URL background mode. If a fetcher
+   task is already running we just kick it; otherwise we spawn one,
+   which now fetches before sleeping. */
+extern "C" void app_cfg_bg_fetch_now(void)
+{
+    if (g_cfg.bg_mode != 2 || !g_cfg.bg_url[0]) return;
+    bg_fetcher_ensure();
+}
 extern "C" void app_cfg_set_clock_text(const char *s)
 {
     if (!s) s = "";
@@ -1978,9 +1986,165 @@ extern "C" void clock_bg_apply(void)
    LVGL to reload the canvas. */
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+/* tjpgd.h has its own extern "C" guard, so include it normally.
+   lodepng.h does not, and it has C++ overloads in namespace lodepng
+   that conflict if wrapped in extern "C". Forward-declare the
+   plain-C symbols we use instead.
+
+   Note: lodepng's *_file APIs go through LVGL's lv_fs_* layer which
+   isn't enabled here. Use the memory API and read the file ourselves. */
+#include "extra/libs/sjpg/tjpgd.h"
+extern "C" unsigned lodepng_decode32(unsigned char **out,
+                                     unsigned *w, unsigned *h,
+                                     const unsigned char *in, size_t insize);
+extern "C" const char *lodepng_error_text(unsigned code);
 
 static TaskHandle_t s_bg_fetcher = NULL;
 static volatile bool s_bg_fetcher_kick = false;
+
+/* Pack an RGBA8888/RGB888 src image of size sw x sh into the canvas
+   buffer at canvas_w x canvas_h, RGB565 panel byte order
+   (LV_COLOR_16_SWAP -- high byte first per pixel). Nearest-neighbor
+   scale (good enough for backgrounds; no allocations beyond the dest
+   .part file). bytes_per_px is 3 (RGB) or 4 (RGBA). */
+static int bg_pack_to_canvas_file(const uint8_t *src, int sw, int sh,
+                                  int bytes_per_px, const char *out_path)
+{
+    int dw = canvas_w, dh = canvas_h;
+    FILE *f = fopen(out_path, "wb");
+    if (!f) return -1;
+    /* Write one row at a time. Allocate one row buffer in PSRAM. */
+    uint16_t *row = (uint16_t *)heap_caps_malloc(
+        (size_t)dw * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!row) { fclose(f); return -1; }
+    for (int y = 0; y < dh; y++) {
+        int sy = (int)((int64_t)y * sh / dh);
+        if (sy >= sh) sy = sh - 1;
+        const uint8_t *srow = src + (size_t)sy * sw * bytes_per_px;
+        for (int x = 0; x < dw; x++) {
+            int sx = (int)((int64_t)x * sw / dw);
+            if (sx >= sw) sx = sw - 1;
+            const uint8_t *p = srow + (size_t)sx * bytes_per_px;
+            uint16_t v = (uint16_t)(((p[0] & 0xF8) << 8) |
+                                    ((p[1] & 0xFC) << 3) |
+                                    ((p[2] & 0xF8) >> 3));
+            /* Panel byte order. */
+            row[x] = (uint16_t)((v >> 8) | (v << 8));
+        }
+        if (fwrite(row, 2, dw, f) != (size_t)dw) {
+            free(row); fclose(f); return -1;
+        }
+    }
+    free(row);
+    fclose(f);
+    return 0;
+}
+
+/* tjpgd input callback: pull bytes from a stdio FILE*. */
+static size_t bg_jpg_in(JDEC *jd, uint8_t *buf, size_t nbyte)
+{
+    FILE *f = (FILE *)jd->device;
+    if (!buf) {
+        /* Skip nbyte bytes. */
+        return fseek(f, nbyte, SEEK_CUR) == 0 ? nbyte : 0;
+    }
+    return fread(buf, 1, nbyte, f);
+}
+
+/* tjpgd uses jd->device for the input source (a FILE*), so the
+   output callback reaches the dest framebuffer through a file-static
+   pointer that bg_decode_jpeg sets up around the decode call. */
+struct jpg_out_ctx {
+    uint8_t *buf;
+    int w, h;
+};
+static struct jpg_out_ctx *s_jpg_out_ctx = NULL;
+static int bg_jpg_out_real(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    (void)jd;
+    struct jpg_out_ctx *c = s_jpg_out_ctx;
+    if (!c || !c->buf) return 0;
+    const uint8_t *src = (const uint8_t *)bitmap;
+    int rw = rect->right - rect->left + 1;
+    int rh = rect->bottom - rect->top + 1;
+    for (int y = 0; y < rh; y++) {
+        int dy = rect->top + y;
+        if (dy >= c->h) break;
+        uint8_t *drow = c->buf + ((size_t)dy * c->w + rect->left) * 3;
+        int copy = rw;
+        if (rect->left + copy > c->w) copy = c->w - rect->left;
+        if (copy > 0) memcpy(drow, src + (size_t)y * rw * 3, (size_t)copy * 3);
+    }
+    return 1;
+}
+
+static int bg_decode_jpeg(const char *path, const char *out_path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    /* tjpgd needs a working buffer; ~3 KB is the documented minimum,
+       use 8 KB to be safe. */
+    const size_t pool_sz = 8 * 1024;
+    void *pool = heap_caps_malloc(pool_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pool) { fclose(f); return -1; }
+    JDEC jd;
+    JRESULT r = jd_prepare(&jd, bg_jpg_in, pool, pool_sz, f);
+    if (r != JDR_OK) {
+        ESP_LOGW(TAG, "bg jpeg: jd_prepare -> %d", r);
+        free(pool); fclose(f); return -1;
+    }
+    /* Allocate full RGB888 frame in PSRAM. */
+    size_t fb_sz = (size_t)jd.width * jd.height * 3;
+    uint8_t *fb = (uint8_t *)heap_caps_malloc(fb_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!fb) {
+        ESP_LOGW(TAG, "bg jpeg: no PSRAM for %ux%u frame", jd.width, jd.height);
+        free(pool); fclose(f); return -1;
+    }
+    struct jpg_out_ctx ctx = { fb, jd.width, jd.height };
+    s_jpg_out_ctx = &ctx;
+    r = jd_decomp(&jd, bg_jpg_out_real, 0);
+    s_jpg_out_ctx = NULL;
+    free(pool);
+    fclose(f);
+    if (r != JDR_OK) {
+        ESP_LOGW(TAG, "bg jpeg: jd_decomp -> %d", r);
+        free(fb);
+        return -1;
+    }
+    int rc = bg_pack_to_canvas_file(fb, jd.width, jd.height, 3, out_path);
+    free(fb);
+    return rc;
+}
+
+static int bg_decode_png(const char *path, const char *out_path)
+{
+    /* Slurp the PNG into a PSRAM buffer -- lodepng's *_file API uses
+       LVGL's lv_fs_* abstraction which isn't wired up here. */
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsz <= 0 || fsz > 4 * 1024 * 1024) { fclose(f); return -1; }
+    unsigned char *src = (unsigned char *)heap_caps_malloc(
+        (size_t)fsz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!src) { fclose(f); return -1; }
+    size_t rd = fread(src, 1, (size_t)fsz, f);
+    fclose(f);
+    if (rd != (size_t)fsz) { free(src); return -1; }
+    unsigned char *img = NULL;
+    unsigned int w = 0, h = 0;
+    unsigned err = lodepng_decode32(&img, &w, &h, src, (size_t)fsz);
+    free(src);
+    if (err) {
+        ESP_LOGW(TAG, "bg png: lodepng err %u (%s)", err, lodepng_error_text(err));
+        if (img) free(img);
+        return -1;
+    }
+    int rc = bg_pack_to_canvas_file(img, (int)w, (int)h, 4, out_path);
+    free(img);
+    return rc;
+}
 
 static esp_err_t bg_fetch_once(const char *url)
 {
@@ -2000,33 +2164,70 @@ static esp_err_t bg_fetch_once(const char *url)
         esp_http_client_close(c); esp_http_client_cleanup(c);
         return ESP_FAIL;
     }
-    /* Stream straight into a temp file then rename so a partial
-       response doesn't corrupt CLOCK_BG_PATH. */
-    char tmp[80];
-    snprintf(tmp, sizeof(tmp), "%s.part", CLOCK_BG_PATH);
-    FILE *f = fopen(tmp, "wb");
+    /* Stream the raw download (whatever format) to a temp file. */
+    char dl[80];
+    snprintf(dl, sizeof(dl), "%s.dl", CLOCK_BG_PATH);
+    FILE *f = fopen(dl, "wb");
     if (!f) { esp_http_client_close(c); esp_http_client_cleanup(c); return ESP_FAIL; }
     char *buf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) { fclose(f); esp_http_client_close(c); esp_http_client_cleanup(c); return ESP_ERR_NO_MEM; }
     int total = 0;
+    uint8_t magic[8] = {0};
+    int magic_have = 0;
     while (1) {
         int n = esp_http_client_read(c, buf, 4096);
         if (n <= 0) break;
         if (fwrite(buf, 1, n, f) != (size_t)n) break;
+        if (magic_have < (int)sizeof(magic)) {
+            int take = n < (int)sizeof(magic) - magic_have
+                       ? n : (int)sizeof(magic) - magic_have;
+            memcpy(magic + magic_have, buf, take);
+            magic_have += take;
+        }
         total += n;
     }
     free(buf);
     fclose(f);
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
+    if (total <= 0) { unlink(dl); return ESP_FAIL; }
+
+    char tmp[80];
+    snprintf(tmp, sizeof(tmp), "%s.part", CLOCK_BG_PATH);
+
     size_t need = (size_t)canvas_w * canvas_h * 2;
-    if ((size_t)total != need) {
-        ESP_LOGW(TAG, "bg fetch: %d bytes, need %zu", total, need);
-        unlink(tmp);
-        return ESP_ERR_INVALID_SIZE;
+    int packed = -1;
+    if (magic_have >= 8 && magic[0] == 0x89 && magic[1] == 'P' &&
+        magic[2] == 'N' && magic[3] == 'G') {
+        ESP_LOGI(TAG, "bg fetched %d bytes (png) from %s", total, url);
+        packed = bg_decode_png(dl, tmp);
+    } else if (magic_have >= 3 && magic[0] == 0xFF && magic[1] == 0xD8 &&
+               magic[2] == 0xFF) {
+        ESP_LOGI(TAG, "bg fetched %d bytes (jpeg) from %s", total, url);
+        packed = bg_decode_jpeg(dl, tmp);
+    } else if ((size_t)total == need) {
+        /* Raw RGB565 panel-byte-order payload -- just promote it. */
+        ESP_LOGI(TAG, "bg fetched %d bytes (raw rgb565) from %s", total, url);
+        packed = rename(dl, tmp);
+    } else {
+        ESP_LOGW(TAG, "bg fetch: unknown format, %d bytes (need %zu raw or png/jpeg)",
+                 total, need);
     }
-    rename(tmp, CLOCK_BG_PATH);
-    ESP_LOGI(TAG, "bg fetched %d bytes from %s", total, url);
+    unlink(dl);    /* harmless if rename already consumed it */
+    if (packed != 0) {
+        unlink(tmp);
+        return ESP_FAIL;
+    }
+    /* FATFS rename() doesn't overwrite an existing destination -- unlink
+       first so the new background actually replaces the old one. */
+    unlink(CLOCK_BG_PATH);
+    int rr = rename(tmp, CLOCK_BG_PATH);
+    if (rr != 0) {
+        ESP_LOGW(TAG, "bg fetch: rename %s -> %s failed (errno=%d)",
+                 tmp, CLOCK_BG_PATH, errno);
+        unlink(tmp);
+        return ESP_FAIL;
+    }
     /* Repaint on the LVGL task. */
     if (lvgl_lock(50)) { clock_bg_apply(); lvgl_unlock(); }
     return ESP_OK;
@@ -2036,16 +2237,18 @@ static void bg_fetcher_task(void *arg)
 {
     (void)arg;
     while (1) {
-        /* Sleep until kicked or interval elapses. */
-        int wait_s = g_cfg.bg_refresh_s > 0 ? g_cfg.bg_refresh_s : 60;
+        if (g_cfg.bg_mode != 2 || !g_cfg.bg_url[0]) goto out;
+        bg_fetch_once(g_cfg.bg_url);
+        /* refresh_s == 0 means "once" -- exit after the first fetch
+           (but the kick flag can still wake us via bg_fetcher_ensure
+           spawning a fresh task). */
+        if (g_cfg.bg_refresh_s == 0) goto out;
+        int wait_s = g_cfg.bg_refresh_s;
         for (int i = 0; i < wait_s * 10; i++) {
             if (s_bg_fetcher_kick) { s_bg_fetcher_kick = false; break; }
             vTaskDelay(pdMS_TO_TICKS(100));
-            /* If user switched off URL mode, exit. */
             if (g_cfg.bg_mode != 2) goto out;
         }
-        if (g_cfg.bg_mode != 2 || !g_cfg.bg_url[0]) goto out;
-        bg_fetch_once(g_cfg.bg_url);
     }
 out:
     s_bg_fetcher = NULL;

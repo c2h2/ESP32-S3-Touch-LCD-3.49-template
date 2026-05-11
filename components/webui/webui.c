@@ -69,6 +69,7 @@ extern void app_cfg_set_bg_mode(int m);
 extern void app_cfg_set_bg_url(const char *url);
 extern void app_cfg_set_bg_refresh_s(int s);
 extern void app_cfg_clock_bg_reload(void);
+extern void app_cfg_bg_fetch_now(void);
 extern uint32_t app_cfg_get_bg_color(void);
 extern void app_cfg_set_bg_color(uint32_t rgba);
 /* Snapshot the LCD framebuffer into the caller's buffer (RGB565,
@@ -183,6 +184,7 @@ static const char k_index_html[] =
 " <input id=bgurl type=text style='width:100%;background:#111;color:#eee;border:1px solid #333;padding:6px;border-radius:4px' placeholder='https://example.com/bg.rgb565'>\n"
 " <label>refresh every (s, 0=once)</label>\n"
 " <input id=bgref type=number min=0 max=86400 value=0 style='width:120px'>\n"
+" <button id=bgfetch>Fetch now</button> <span id=bgfetchstat class=meta></span>\n"
 "</section>\n"
 "<section><h2>Settings</h2>\n"
 " <label>brightness: <span id=brl>?</span></label>\n"
@@ -271,6 +273,7 @@ static const char k_index_html[] =
 "let bgUrlT;document.getElementById('bgurl').oninput=e=>{clearTimeout(bgUrlT);bgUrlT=setTimeout(()=>pushBg({url:e.target.value}),400)};\n"
 "document.getElementById('bgref').onchange=e=>pushBg({refresh_s:e.target.value});\n"
 "document.getElementById('bgc').onchange=e=>{let h=e.target.value;let r=parseInt(h.substr(1,2),16),g=parseInt(h.substr(3,2),16),b=parseInt(h.substr(5,2),16);pushBg({color:(((r<<24)|(g<<16)|(b<<8)|0xff)>>>0)})};\n"
+"document.getElementById('bgfetch').onclick=async()=>{let s=document.getElementById('bgfetchstat');s.textContent='fetching...';try{let r=await fetch('/api/bg/fetch',{method:'POST'});let j=await r.json();s.textContent=j.ok?'fetched':('failed: '+(j.err||r.status))}catch(e){s.textContent='failed'}};\n"
 /* Convert the picked image: load -> draw to a canvas of canvas_w x
    canvas_h -> read pixels -> pack RGB565 -> byte-swap to panel order
    -> POST to /api/bg/upload as raw binary. */
@@ -623,6 +626,23 @@ static esp_err_t h_bg_upload(httpd_req_t *r)
     return send_str(r, "application/json", "{\"ok\":true}");
 }
 
+/* Manual "fetch now" trigger for URL background mode. Kicks the
+   fetcher; the actual download happens on a background task. */
+static esp_err_t h_bg_fetch(httpd_req_t *r)
+{
+    if (app_cfg_get_bg_mode() != 2) {
+        return send_str(r, "application/json",
+                        "{\"ok\":false,\"err\":\"not in URL mode\"}");
+    }
+    const char *u = app_cfg_get_bg_url();
+    if (!u || !u[0]) {
+        return send_str(r, "application/json",
+                        "{\"ok\":false,\"err\":\"empty URL\"}");
+    }
+    app_cfg_bg_fetch_now();
+    return send_str(r, "application/json", "{\"ok\":true}");
+}
+
 /* ---------- /api/rec start/stop and /api/play|stop ---------- */
 
 static esp_err_t h_rec_start(httpd_req_t *r)
@@ -832,6 +852,7 @@ esp_err_t webui_start(void)
         { .uri = "/api/clock",       .method = HTTP_POST, .handler = h_clock },
         { .uri = "/api/bg",          .method = HTTP_POST, .handler = h_bg },
         { .uri = "/api/bg/upload",   .method = HTTP_POST, .handler = h_bg_upload },
+        { .uri = "/api/bg/fetch",    .method = HTTP_POST, .handler = h_bg_fetch },
         { .uri = "/api/rec/start",   .method = HTTP_POST, .handler = h_rec_start },
         { .uri = "/api/rec/stop",    .method = HTTP_POST, .handler = h_rec_stop },
         { .uri = "/api/play",        .method = HTTP_POST, .handler = h_play },
