@@ -2325,6 +2325,15 @@ static esp_err_t bg_fetch_once(const char *url)
 static void bg_fetcher_task(void *arg)
 {
     (void)arg;
+    /* Same Wi-Fi + radio-init defer as the quotes task. The TLS
+       handshake during the first HTTPS GET will allocate enough
+       internal RAM to starve radio_init's I2S DMA descriptors on a
+       fragmented heap. */
+    for (int i = 0; i < 120; i++) {
+        if (g_wifi_connected) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
     while (1) {
         if (g_cfg.bg_mode != 2 || !g_cfg.bg_url[0]) goto out;
         bg_fetch_once(g_cfg.bg_url);
@@ -2590,6 +2599,19 @@ static void quotes_kick(void)
 static void quotes_task(void *arg)
 {
     (void)arg;
+    /* Hold off the first fetch until Wi-Fi is up and the radio engine
+       had time to claim I2S / codec resources. The HTTPS handshake's
+       internal-RAM allocations are big enough to starve the radio
+       engine's I2S DMA descriptors if we race it on a fragmented heap.
+       Waiting up to ~12s for the IP costs nothing because nothing else
+       is consuming this task. */
+    for (int i = 0; i < 120; i++) {
+        if (g_wifi_connected) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    /* Plus a small extra so radio_engine_warm_at_boot has time to finish
+       its codec init on the other core. */
+    vTaskDelay(pdMS_TO_TICKS(2000));
     while (1) {
         struct quote_data ql = {}, qr = {};
         /* Fetch both sides in series -- two HTTPS connections back to
